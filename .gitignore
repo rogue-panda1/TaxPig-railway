@@ -1,0 +1,9 @@
+node_modules/
+.env
+.env.*
+*.log
+.DS_Store
+test.pdf
+out*.png
+headers.txt
+h.txt

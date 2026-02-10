@@ -1,0 +1,14 @@
+# Nixpacks config for Railway
+# Installs LibreOffice (soffice) for Office → PDF conversion
+
+[phases.setup]
+aptPkgs = ["...", "libreoffice", "libreoffice-writer", "libreoffice-calc", "libreoffice-impress"]
+
+[phases.install]
+cmds = ["npm ci"]
+
+[phases.build]
+cmds = ["echo 'No build step'"]
+
+[start]
+cmd = "node server.js"

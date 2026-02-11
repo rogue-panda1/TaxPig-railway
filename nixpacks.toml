@@ -2,7 +2,18 @@
 # Installs LibreOffice (soffice) for Office → PDF conversion
 
 [phases.setup]
-aptPkgs = ["...", "libreoffice", "libreoffice-writer", "libreoffice-calc", "libreoffice-impress"]
+aptPkgs = [
+  "...",
+  "libreoffice",
+  "libreoffice-writer",
+  "libreoffice-calc",
+  "libreoffice-impress",
+  "poppler-utils",
+  "ghostscript",
+  "fontconfig",
+  "fonts-dejavu-core",
+  "fonts-liberation"
+]
 
 [phases.install]
 cmds = ["npm ci"]

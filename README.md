@@ -28,6 +28,11 @@ Runs on [Railway](https://railway.app) with optional size and type restrictions.
 | `PORT` | No | `3000` | Server port (Railway sets this) |
 | `MAX_MB` | No | `25` | Max upload size in MB |
 | `ALLOWED_TYPES` | No | *(all)* | Comma-separated extensions, e.g. `pdf,docx,xlsx` |
+| `PDF_RENDERERS` | No | `pdftocairo,ghostscript,pdfjs` | Renderer fallback order for PDF pages |
+| `PDF_RENDER_DPI` | No | `200` | DPI for `pdftocairo`/`ghostscript` output |
+| `PDF_RENDER_TIMEOUT_MS` | No | `120000` | Timeout for a single PDF render attempt |
+| `PDF_MAX_PIXELS` | No | `40000000` | Safety cap (`width*height`) to avoid huge outputs |
+| `OFFICE_TIMEOUT_MS` | No | `120000` | Timeout for Office -> PDF conversion |
 
 ## cURL examples
 
@@ -167,5 +172,12 @@ For `/convert/office` locally you need LibreOffice:
 
 ## Stack
 
-- **PDF → PNG:** `pdfjs-dist` + `@napi-rs/canvas`
+- **PDF → PNG:** fallback chain `pdftocairo` -> `ghostscript` -> `pdfjs-dist + @napi-rs/canvas`
 - **Office → PDF → PNG:** headless LibreOffice (`soffice`) in a temp dir, then the same PDF→PNG pipeline
+
+## Reliability notes (important)
+
+- For production reliability, keep `pdftocairo` first in `PDF_RENDERERS`. It is usually the most faithful for text rendering.
+- `ghostscript` is a strong second fallback for unusual PDFs.
+- `pdfjs` stays as a third fallback, useful when external binaries are unavailable.
+- Response headers include `X-Renderer` so you can log which engine produced each image.

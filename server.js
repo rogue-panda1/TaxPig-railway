@@ -3,12 +3,20 @@ const multer = require('multer');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { execSync } = require('child_process');
-const { createCanvas } = require('@napi-rs/canvas');
+const { execSync, execFileSync } = require('child_process');
+const { createCanvas, loadImage } = require('@napi-rs/canvas');
 
 const PORT = Number(process.env.PORT) || 3000;
 const MAX_MB = Number(process.env.MAX_MB) || 25;
 const MAX_BYTES = MAX_MB * 1024 * 1024;
+const PDF_RENDER_TIMEOUT_MS = Number(process.env.PDF_RENDER_TIMEOUT_MS) || 120000;
+const OFFICE_TIMEOUT_MS = Number(process.env.OFFICE_TIMEOUT_MS) || 120000;
+const PDF_RENDER_DPI = Number(process.env.PDF_RENDER_DPI) || 200;
+const PDF_MAX_PIXELS = Number(process.env.PDF_MAX_PIXELS) || 40000000;
+const PDF_RENDERERS = (process.env.PDF_RENDERERS || 'pdftocairo,ghostscript,pdfjs')
+  .split(',')
+  .map((r) => r.trim().toLowerCase())
+  .filter(Boolean);
 const ALLOWED_TYPES = process.env.ALLOWED_TYPES
   ? process.env.ALLOWED_TYPES.split(',').map((t) => t.trim().toLowerCase())
   : null;
@@ -45,6 +53,7 @@ function setMetadataHeaders(res, meta) {
   res.setHeader('X-Page-Number', String(meta.pageNumber ?? 1));
   res.setHeader('X-Width', String(meta.width ?? 0));
   res.setHeader('X-Height', String(meta.height ?? 0));
+  if (meta.renderer) res.setHeader('X-Renderer', String(meta.renderer));
 }
 
 function wantsJsonResponse(req) {
@@ -72,16 +81,27 @@ function getFilename(req, fallback) {
   return req.file?.originalname || req.get('X-Filename') || fallback;
 }
 
-async function pdfToPng(pdfBuffer, pageNumber = 1) {
+async function getPdfPageCount(pdfBuffer) {
   const pdfjsLib = await import('pdfjs-dist/legacy/build/pdf.mjs');
   const data = new Uint8Array(pdfBuffer);
   const doc = await pdfjsLib.getDocument({ data, useSystemFonts: true }).promise;
   const numPages = doc.numPages;
-  const page = await doc.getPage(Math.min(pageNumber, numPages));
+  await doc.destroy();
+  return numPages;
+}
+
+async function renderPdfWithPdfjs(pdfBuffer, pageNumber, numPages) {
+  const pdfjsLib = await import('pdfjs-dist/legacy/build/pdf.mjs');
+  const data = new Uint8Array(pdfBuffer);
+  const doc = await pdfjsLib.getDocument({ data, useSystemFonts: true }).promise;
+  const page = await doc.getPage(Math.min(pageNumber, numPages || doc.numPages));
   const scale = 2;
   const viewport = page.getViewport({ scale });
   const w = Math.floor(viewport.width);
   const h = Math.floor(viewport.height);
+  if (w * h > PDF_MAX_PIXELS) {
+    throw new Error(`pdfjs viewport too large (${w}x${h}).`);
+  }
 
   const canvas = createCanvas(w, h);
   const ctx = canvas.getContext('2d');
@@ -92,10 +112,150 @@ async function pdfToPng(pdfBuffer, pageNumber = 1) {
 
   const pngData = await canvas.encode('png');
   const pngBuffer = Buffer.isBuffer(pngData) ? pngData : Buffer.from(pngData);
+  await doc.destroy();
   return {
     pngBuffer,
-    meta: { pageCount: numPages, pageNumber: Math.min(pageNumber, numPages), width: w, height: h },
+    meta: {
+      pageCount: numPages || doc.numPages,
+      pageNumber: Math.min(pageNumber, numPages || doc.numPages),
+      width: w,
+      height: h,
+      renderer: 'pdfjs',
+    },
   };
+}
+
+async function renderPdfWithPdftocairo(pdfBuffer, pageNumber, numPages) {
+  let tmpDir = null;
+  try {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pdf-poppler-'));
+    const inputPath = path.join(tmpDir, 'input.pdf');
+    const outputPrefix = path.join(tmpDir, 'page');
+    const outputPath = `${outputPrefix}.png`;
+    fs.writeFileSync(inputPath, pdfBuffer);
+
+    execFileSync(
+      'pdftocairo',
+      [
+        '-png',
+        '-singlefile',
+        '-f', String(pageNumber),
+        '-l', String(pageNumber),
+        '-r', String(PDF_RENDER_DPI),
+        inputPath,
+        outputPrefix,
+      ],
+      { stdio: 'pipe', timeout: PDF_RENDER_TIMEOUT_MS }
+    );
+
+    if (!fs.existsSync(outputPath)) {
+      throw new Error('pdftocairo produced no PNG output.');
+    }
+    const pngBuffer = fs.readFileSync(outputPath);
+    const img = await loadImage(pngBuffer);
+    const w = img.width || 0;
+    const h = img.height || 0;
+    if (w * h > PDF_MAX_PIXELS) {
+      throw new Error(`pdftocairo output too large (${w}x${h}).`);
+    }
+    return {
+      pngBuffer,
+      meta: {
+        pageCount: numPages,
+        pageNumber,
+        width: w,
+        height: h,
+        renderer: 'pdftocairo',
+      },
+    };
+  } finally {
+    if (tmpDir && fs.existsSync(tmpDir)) {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  }
+}
+
+async function renderPdfWithGhostscript(pdfBuffer, pageNumber, numPages) {
+  let tmpDir = null;
+  try {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pdf-gs-'));
+    const inputPath = path.join(tmpDir, 'input.pdf');
+    const outputPath = path.join(tmpDir, 'page.png');
+    fs.writeFileSync(inputPath, pdfBuffer);
+
+    execFileSync(
+      'gs',
+      [
+        '-dSAFER',
+        '-dBATCH',
+        '-dNOPAUSE',
+        '-sDEVICE=png16m',
+        '-dTextAlphaBits=4',
+        '-dGraphicsAlphaBits=4',
+        `-r${PDF_RENDER_DPI}`,
+        `-dFirstPage=${pageNumber}`,
+        `-dLastPage=${pageNumber}`,
+        `-sOutputFile=${outputPath}`,
+        inputPath,
+      ],
+      { stdio: 'pipe', timeout: PDF_RENDER_TIMEOUT_MS }
+    );
+
+    if (!fs.existsSync(outputPath)) {
+      throw new Error('ghostscript produced no PNG output.');
+    }
+    const pngBuffer = fs.readFileSync(outputPath);
+    const img = await loadImage(pngBuffer);
+    const w = img.width || 0;
+    const h = img.height || 0;
+    if (w * h > PDF_MAX_PIXELS) {
+      throw new Error(`ghostscript output too large (${w}x${h}).`);
+    }
+    return {
+      pngBuffer,
+      meta: {
+        pageCount: numPages,
+        pageNumber,
+        width: w,
+        height: h,
+        renderer: 'ghostscript',
+      },
+    };
+  } finally {
+    if (tmpDir && fs.existsSync(tmpDir)) {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  }
+}
+
+async function pdfToPng(pdfBuffer, pageNumber = 1) {
+  let numPages = null;
+  try {
+    numPages = await getPdfPageCount(pdfBuffer);
+  } catch (e) {
+    // If page-count probing fails, still try renderers with requested page.
+    console.warn('Could not read PDF page count:', e.message);
+  }
+  const safePage = numPages ? Math.min(pageNumber, numPages) : pageNumber;
+  const attempts = [];
+
+  for (const renderer of PDF_RENDERERS) {
+    try {
+      if (renderer === 'pdftocairo') {
+        return await renderPdfWithPdftocairo(pdfBuffer, safePage, numPages);
+      }
+      if (renderer === 'ghostscript') {
+        return await renderPdfWithGhostscript(pdfBuffer, safePage, numPages);
+      }
+      if (renderer === 'pdfjs') {
+        return await renderPdfWithPdfjs(pdfBuffer, safePage, numPages);
+      }
+      attempts.push({ renderer, error: 'unknown renderer' });
+    } catch (e) {
+      attempts.push({ renderer, error: e.message });
+    }
+  }
+  throw new Error(`All renderers failed: ${JSON.stringify(attempts)}`);
 }
 
 async function handlePdfRequest(req, res) {
@@ -138,7 +298,7 @@ async function handleOfficeRequest(req, res) {
 
     execSync(
       `soffice --headless --convert-to pdf --outdir "${tmpDir}" "${inputPath}"`,
-      { stdio: 'pipe', timeout: 60000 }
+      { stdio: 'pipe', timeout: OFFICE_TIMEOUT_MS }
     );
 
     const base = path.basename(inputPath, ext);
@@ -234,5 +394,7 @@ app.use((err, req, res, next) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Convert server listening on port ${PORT} (MAX_MB=${MAX_MB})`);
+  console.log(
+    `Convert server listening on port ${PORT} (MAX_MB=${MAX_MB}, PDF_RENDERERS=${PDF_RENDERERS.join(',')})`
+  );
 });

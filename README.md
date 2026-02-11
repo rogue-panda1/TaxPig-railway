@@ -7,6 +7,7 @@ Runs on [Railway](https://railway.app) with optional size and type restrictions.
 
 | Method | Path | Description |
 |--------|------|-------------|
+| POST | `/convert` | Compatibility route: auto-detect PDF vs Office by extension; supports `?mode=pdf|office` |
 | POST | `/convert/pdf` | Convert PDF to PNG (first page by default) |
 | POST | `/convert/office` | Convert Office document to PDF then to PNG |
 | GET | `/health` | Health check |
@@ -30,6 +31,24 @@ Runs on [Railway](https://railway.app) with optional size and type restrictions.
 ```bash
 curl -X POST http://localhost:3000/convert/pdf \
   -F "file=@document.pdf" \
+  --output page.png \
+  -D -
+```
+
+**Compatibility route (`/convert`) with PDF:**
+
+```bash
+curl -X POST http://localhost:3000/convert \
+  -F "file=@document.pdf" \
+  --output page.png \
+  -D -
+```
+
+**Compatibility route (`/convert`) with Office mode forced:**
+
+```bash
+curl -X POST "http://localhost:3000/convert?mode=office" \
+  -F "file=@report.docx" \
   --output page.png \
   -D -
 ```

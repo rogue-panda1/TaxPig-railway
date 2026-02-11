@@ -13,7 +13,12 @@ Runs on [Railway](https://railway.app) with optional size and type restrictions.
 | GET | `/health` | Health check |
 
 - **Input:** multipart form (`file` field) or raw body (binary).
-- **Output:** `image/png` body; metadata in response headers (base64 JSON in `X-Conversion-Metadata`, plus `X-Page-Count`, `X-Page-Number`, `X-Width`, `X-Height`).
+- **Output (default):** `image/png` body; metadata in response headers (base64 JSON in `X-Conversion-Metadata`, plus `X-Page-Count`, `X-Page-Number`, `X-Width`, `X-Height`).
+- **Output (optional JSON):** add `?response=json` (or header `X-Response-Format: json`, or `Accept: application/json`) to get JSON:
+  - `ok`
+  - `contentType` (`image/png`)
+  - `metadata`
+  - `imageBase64`
 - **Query:** `?page=2` for a specific page (default `1`).
 
 ## Environment variables
@@ -51,6 +56,13 @@ curl -X POST "http://localhost:3000/convert?mode=office" \
   -F "file=@report.docx" \
   --output page.png \
   -D -
+```
+
+**JSON response mode (for automation that expects JSON):**
+
+```bash
+curl -X POST "http://localhost:3000/convert?response=json" \
+  -F "file=@document.pdf"
 ```
 
 **PDF → PNG (raw buffer):**

@@ -47,6 +47,27 @@ function setMetadataHeaders(res, meta) {
   res.setHeader('X-Height', String(meta.height ?? 0));
 }
 
+function wantsJsonResponse(req) {
+  const queryResponse = String(req.query.response || req.query.format || '').toLowerCase();
+  const headerResponse = String(req.get('X-Response-Format') || '').toLowerCase();
+  const accept = String(req.get('Accept') || '').toLowerCase();
+  return queryResponse === 'json' || headerResponse === 'json' || accept.includes('application/json');
+}
+
+function sendConversionResponse(req, res, pngBuffer, meta) {
+  setMetadataHeaders(res, meta);
+  if (wantsJsonResponse(req)) {
+    return res.json({
+      ok: true,
+      contentType: 'image/png',
+      metadata: meta,
+      imageBase64: pngBuffer.toString('base64'),
+    });
+  }
+  res.setHeader('Content-Type', 'image/png');
+  return res.send(pngBuffer);
+}
+
 function getFilename(req, fallback) {
   return req.file?.originalname || req.get('X-Filename') || fallback;
 }
@@ -92,9 +113,7 @@ async function handlePdfRequest(req, res) {
 
   const pageNumber = Math.max(1, parseInt(req.query.page || '1', 10));
   const { pngBuffer, meta } = await pdfToPng(buf, pageNumber);
-  setMetadataHeaders(res, meta);
-  res.setHeader('Content-Type', 'image/png');
-  return res.send(pngBuffer);
+  return sendConversionResponse(req, res, pngBuffer, meta);
 }
 
 async function handleOfficeRequest(req, res) {
@@ -130,10 +149,7 @@ async function handleOfficeRequest(req, res) {
     const pdfBuffer = fs.readFileSync(pdfPath);
     const pageNumber = Math.max(1, parseInt(req.query.page || '1', 10));
     const { pngBuffer, meta } = await pdfToPng(pdfBuffer, pageNumber);
-
-    setMetadataHeaders(res, meta);
-    res.setHeader('Content-Type', 'image/png');
-    return res.send(pngBuffer);
+    return sendConversionResponse(req, res, pngBuffer, meta);
   } finally {
     if (tmpDir && fs.existsSync(tmpDir)) {
       try {

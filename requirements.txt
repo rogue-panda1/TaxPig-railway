@@ -1,0 +1,1 @@
+-r bank_parser_service/requirements.txt

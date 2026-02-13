@@ -6,3 +6,5 @@ pydantic
 pdf2image
 pytesseract
 Pillow
+openai
+requests

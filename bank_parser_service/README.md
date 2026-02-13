@@ -23,6 +23,9 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 - `MAX_UPLOAD_MB` (default `20`)
 - `MIN_WORDS_PER_PAGE` (default `25`)
 - `OCR_DPI` (default `250`)
+- `OPENAI_API_KEY` (optional, enables compact GPT repair/validation)
+- `GPT_MODEL` (optional, default `gpt-4o-mini`)
+- `CONFIDENCE_REVIEW_THRESHOLD` (default `0.55`)
 
 ## Example request
 
@@ -36,7 +39,7 @@ curl -X POST "http://localhost:8000/parse-bank-statement" \
 
 - Uses `pdfplumber` first for digital PDFs.
 - OCR is page-level fallback only when page quality checks fail.
-- GPT repair function is compact-policy ready and currently conservative (skips by default).
+- Compact GPT integration sends only headers + sampled rows + failed rows (never full OCR dump).
 - For image files, OCR is used directly.
 
 ## Batch test helper
@@ -46,4 +49,32 @@ Run all files in `testfiles/` and print a summary:
 ```bash
 cd bank_parser_service
 ./.venv/bin/python testfiles/run_batch_eval.py
+```
+
+## View transactions as a table
+
+### Browser viewer
+
+Run the API locally and open:
+
+`http://localhost:8000/parse-bank-statement/viewer`
+
+Upload a file, and it renders the parsed transactions in an HTML table.
+
+### Terminal table output
+
+```bash
+cd bank_parser_service
+./.venv/bin/python print_transactions_table.py \
+  --url "http://localhost:8000/parse-bank-statement" \
+  --file "testfiles/Bank Statement to Feb 2021.pdf" \
+  --token "YOUR_TOKEN"
+```
+
+## Local OCR dependencies
+
+macOS:
+
+```bash
+brew install tesseract poppler
 ```

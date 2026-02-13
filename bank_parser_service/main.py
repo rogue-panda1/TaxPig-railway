@@ -1,14 +1,19 @@
 import io
+import json
 import os
 import re
 import uuid
+from tempfile import SpooledTemporaryFile
+from urllib.parse import unquote, urlparse
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 import pdfplumber
 from fastapi import FastAPI, File, Header, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
+from starlette.datastructures import Headers, UploadFile as StarletteUploadFile
+import requests
 
 
 app = FastAPI(title="TaxPig Bank Statement Parser", version="1.0.0")
@@ -28,6 +33,10 @@ EXPECTED_BEARER = os.getenv("BANK_PARSER_BEARER_TOKEN") or os.getenv(
 OCR_DPI = int(os.getenv("OCR_DPI", "250"))
 MIN_WORDS_PER_PAGE = int(os.getenv("MIN_WORDS_PER_PAGE", "25"))
 MAX_ROW_VERTICAL_GAP = float(os.getenv("MAX_ROW_VERTICAL_GAP", "18"))
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+GPT_MODEL = os.getenv("GPT_MODEL", "gpt-4o-mini")
+GPT_MAX_SAMPLE_ROWS = int(os.getenv("GPT_MAX_SAMPLE_ROWS", "20"))
+CONFIDENCE_REVIEW_THRESHOLD = float(os.getenv("CONFIDENCE_REVIEW_THRESHOLD", "0.55"))
 
 DATE_REGEX = re.compile(
     r"\b(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{2,4}|[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{2,4})\b"
@@ -50,9 +59,12 @@ class Transaction(BaseModel):
     date: str
     payeePayer: str
     description: str
+    transactionDescription: Optional[str] = None
+    originalSourceText: Optional[str] = None
     reference: str
     amount: float
     category: str = "Bank statement import"
+    confidence: Optional[float] = None
 
 
 class RegexPlan(BaseModel):
@@ -503,16 +515,209 @@ def ocr_image_file(image_bytes: bytes) -> Tuple[List[Dict[str, Any]], str]:
         return [], f"ocr_image_failed:{exc}"
 
 
+def _parse_json_object_loose(raw: str) -> Dict[str, Any]:
+    s = (raw or "").strip()
+    if not s:
+        return {}
+    try:
+        return json.loads(s)
+    except Exception:
+        pass
+    # Try fenced code extraction.
+    fence = re.search(r"```(?:json)?\s*(\{.*\})\s*```", s, re.S)
+    if fence:
+        try:
+            return json.loads(fence.group(1))
+        except Exception:
+            return {}
+    # Try first/last brace window.
+    a, b = s.find("{"), s.rfind("}")
+    if a != -1 and b != -1 and b > a:
+        try:
+            return json.loads(s[a : b + 1])
+        except Exception:
+            return {}
+    return {}
+
+
+def _compute_confidence(
+    row: Dict[str, Any],
+    date_value: Optional[str],
+    amount_value: Optional[float],
+    description: str,
+    reference: str,
+) -> float:
+    score = 0.0
+    if date_value:
+        score += 0.35
+    if amount_value is not None:
+        score += 0.35
+    desc_len = len(description)
+    if desc_len >= 16:
+        score += 0.12
+    elif desc_len >= 8:
+        score += 0.06
+    if reference:
+        score += 0.05
+    if DATE_REGEX.search(str(row.get("descriptionRaw", ""))):
+        score += 0.05
+    if AMOUNT_REGEX.search(str(row.get("descriptionRaw", ""))):
+        score += 0.05
+    return round(min(1.0, max(0.0, score)), 2)
+
+
+def _strip_noise_tokens(text: str) -> str:
+    t = text
+    # Drop common statement column labels and trailing fragments.
+    t = re.sub(r"\bDate\b", " ", t, flags=re.I)
+    t = re.sub(r"\bDescription\b", " ", t, flags=re.I)
+    t = re.sub(r"\bType\b", " ", t, flags=re.I)
+    t = re.sub(r"\bMoney\s*Out(?:\s*\(.*?\))?\b", " ", t, flags=re.I)
+    t = re.sub(r"\bMoney\s*In(?:\s*\(.*?\))?\b", " ", t, flags=re.I)
+    t = re.sub(r"\bDebit\b|\bCredit\b|\bAmount\b", " ", t, flags=re.I)
+    t = re.sub(r"\bBalance(?:\s*on)?(?:\s*\(.*?\))?\b.*$", " ", t, flags=re.I)
+    t = re.sub(r"\bblank\b", " ", t, flags=re.I)
+    t = re.sub(r"[.]{2,}", " ", t)
+    return " ".join(t.split()).strip()
+
+
+def _derive_transaction_description(description_raw: str, date_raw: str, amount_raw: str) -> str:
+    original = " ".join((description_raw or "").split())
+    if not original:
+        return ""
+
+    # Best structured pattern first: Description ... Type ...
+    m = re.search(
+        r"\bDescription\b\s*(.*?)\s*(?:\bType\b|\bMoney\s*In\b|\bMoney\s*Out\b|\bBalance\b)",
+        original,
+        flags=re.I,
+    )
+    if m and m.group(1).strip():
+        return " ".join(m.group(1).split())
+
+    text = original
+
+    # Remove leading explicit date token.
+    if date_raw:
+        dr = re.escape(" ".join(date_raw.split()))
+        text = re.sub(rf"^\s*{dr}\s*", " ", text, flags=re.I)
+        text = re.sub(rf"^\s*Date\s*{dr}\s*", " ", text, flags=re.I)
+    else:
+        text = re.sub(rf"^\s*{DATE_REGEX.pattern}\s*", " ", text, flags=re.I)
+
+    # Remove transaction amount token first (keeps payee phrase cleaner).
+    if amount_raw:
+        ar = re.escape(" ".join(str(amount_raw).split()))
+        text = re.sub(rf"\s*{ar}\s*", " ", text, flags=re.I)
+
+    # Remove other trailing amount/balance artifacts.
+    text = re.sub(r"\b(?:£|\$|€)\s*[-(]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{2})\)?(?:\s*(?:CR|DR))?\b", " ", text)
+    text = _strip_noise_tokens(text)
+    # Running balances often remain as a trailing number.
+    text = re.sub(r"\s+(?:£|\$|€)?[-(]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{2})\)?\s*$", " ", text)
+    text = " ".join(text.split()).strip()
+    return text if text else original
+
+
 def repair_rows_with_gpt_compact(
     headers: List[str],
     sample_rows: List[Dict[str, Any]],
     failed_rows: List[Dict[str, Any]],
-) -> Tuple[List[Dict[str, Any]], str]:
-    # Intentionally conservative: tiny-call policy compliant stub.
-    # No full OCR dumps are sent; this function can be upgraded to call GPT with
-    # only compact slices (headers, sample rows, failed rows).
-    _ = headers, sample_rows, failed_rows
-    return [], "gpt_skipped_compact_policy_no_client"
+) -> Tuple[List[Dict[str, Any]], str, List[str]]:
+    if not OPENAI_API_KEY:
+        return [], "gpt_skipped_no_api_key", []
+    try:
+        from openai import OpenAI
+    except Exception as exc:
+        return [], f"gpt_skipped_openai_import_error:{exc}", []
+
+    compact_sample = sample_rows[:GPT_MAX_SAMPLE_ROWS]
+    compact_failed = failed_rows[:GPT_MAX_SAMPLE_ROWS]
+    payload = {
+        "headers": headers,
+        "sample_rows": compact_sample,
+        "failed_rows": compact_failed,
+    }
+    prompt = (
+        "You are repairing bank statement row extraction.\n"
+        "Return STRICT JSON object with keys:\n"
+        "repaired_rows: array of rows with fields {pageNumber,dateRaw,amountRaw,descriptionRaw,referenceRaw,source}\n"
+        "notes: array of short strings\n"
+        "sanity_warnings: array of short strings\n"
+        "Only include rows you are confident about. Do not invent rows.\n"
+        f"Input:\n{json.dumps(payload, ensure_ascii=True)}"
+    )
+    try:
+        client = OpenAI(api_key=OPENAI_API_KEY)
+        resp = client.chat.completions.create(
+            model=GPT_MODEL,
+            temperature=0,
+            messages=[
+                {"role": "system", "content": "You output valid JSON only."},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        content = resp.choices[0].message.content or "{}"
+        obj = _parse_json_object_loose(content)
+        rows = obj.get("repaired_rows", []) if isinstance(obj, dict) else []
+        notes = []
+        if isinstance(obj, dict):
+            for k in ("notes", "sanity_warnings"):
+                v = obj.get(k, [])
+                if isinstance(v, list):
+                    notes.extend(str(x) for x in v[:20])
+        repaired: List[Dict[str, Any]] = []
+        for r in rows if isinstance(rows, list) else []:
+            if not isinstance(r, dict):
+                continue
+            if not (r.get("dateRaw") and r.get("amountRaw") and r.get("descriptionRaw")):
+                continue
+            repaired.append(
+                {
+                    "source": str(r.get("source") or "gpt_repair"),
+                    "pageNumber": int(r.get("pageNumber") or 0),
+                    "dateRaw": str(r.get("dateRaw")),
+                    "amountRaw": str(r.get("amountRaw")),
+                    "descriptionRaw": str(r.get("descriptionRaw")),
+                    "referenceRaw": str(r.get("referenceRaw") or ""),
+                }
+            )
+        return repaired, f"gpt_repair_used model={GPT_MODEL} repaired={len(repaired)}", notes
+    except Exception as exc:
+        return [], f"gpt_repair_failed:{exc}", []
+
+
+def validate_transactions_with_gpt_compact(transactions: List[Dict[str, Any]]) -> Tuple[str, List[str]]:
+    if not OPENAI_API_KEY:
+        return "gpt_validation_skipped_no_api_key", []
+    try:
+        from openai import OpenAI
+    except Exception as exc:
+        return f"gpt_validation_skipped_openai_import_error:{exc}", []
+
+    compact = transactions[:GPT_MAX_SAMPLE_ROWS]
+    prompt = (
+        "Review these parsed transactions for likely extraction issues.\n"
+        "Return STRICT JSON object with key validation_notes as array of short notes.\n"
+        f"transactions={json.dumps(compact, ensure_ascii=True)}"
+    )
+    try:
+        client = OpenAI(api_key=OPENAI_API_KEY)
+        resp = client.chat.completions.create(
+            model=GPT_MODEL,
+            temperature=0,
+            messages=[
+                {"role": "system", "content": "You output valid JSON only."},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        obj = _parse_json_object_loose(resp.choices[0].message.content or "{}")
+        notes = obj.get("validation_notes", []) if isinstance(obj, dict) else []
+        if not isinstance(notes, list):
+            notes = []
+        return f"gpt_validation_used model={GPT_MODEL}", [str(n) for n in notes[:20]]
+    except Exception as exc:
+        return f"gpt_validation_failed:{exc}", []
 
 
 def normalize_transactions(raw_rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
@@ -521,18 +726,23 @@ def normalize_transactions(raw_rows: List[Dict[str, Any]]) -> Tuple[List[Dict[st
     for row in raw_rows:
         date_value = parse_date(str(row.get("dateRaw", "")).strip())
         amount_value = parse_amount(str(row.get("amountRaw", "")).strip())
-        description = " ".join(str(row.get("descriptionRaw", "")).split())
+        original_source_text = " ".join(str(row.get("descriptionRaw", "")).split())
+        description = _derive_transaction_description(
+            original_source_text,
+            str(row.get("dateRaw", "")).strip(),
+            str(row.get("amountRaw", "")).strip(),
+        )
         if _is_summary_non_transaction_line(description):
-            failed.append(row)
+            failed.append({**row, "_reason": "summary_line"})
             continue
         if not date_value or amount_value is None or not description:
-            failed.append(row)
+            failed.append({**row, "_reason": "missing_core_fields"})
             continue
         reference = ""
         ref_match = re.search(r"\b(ref(?:erence)?[:\s-]*[A-Z0-9-]{4,})\b", description, re.I)
         if ref_match:
             reference = ref_match.group(1).strip()
-        d = description.lower()
+        d = f"{description} {original_source_text}".lower()
         if amount_value < 0:
             tx_type = "expense"
         elif re.search(r"\bdeb(it)?\b|\bdr\b|money out|withdrawal|card|purchase|payment to|transfer out", d):
@@ -541,18 +751,178 @@ def normalize_transactions(raw_rows: List[Dict[str, Any]]) -> Tuple[List[Dict[st
             tx_type = "income"
         else:
             tx_type = "income"
+        confidence = _compute_confidence(row, date_value, amount_value, description, reference)
         tx = {
             "id": str(uuid.uuid4()),
             "type": tx_type,
             "date": date_value,
             "payeePayer": description[:120],
             "description": description,
+            "transactionDescription": description,
+            "originalSourceText": original_source_text,
             "reference": reference,
             "amount": abs(round(float(amount_value), 2)),
             "category": "Bank statement import",
+            "confidence": confidence,
         }
         transactions.append(tx)
     return transactions, failed
+
+
+@app.get("/parse-bank-statement/viewer", response_class=HTMLResponse)
+def parse_bank_statement_viewer() -> str:
+    return """<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>TaxPig Parser Viewer</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 24px; }
+    table { border-collapse: collapse; width: 100%; margin-top: 12px; }
+    th, td { border: 1px solid #ddd; padding: 6px; font-size: 12px; }
+    th { background: #f4f4f4; text-align: left; }
+    .muted { color: #666; font-size: 12px; }
+    pre { background: #111; color: #eee; padding: 10px; overflow: auto; }
+  </style>
+</head>
+<body>
+  <h2>Bank Statement Parser Viewer</h2>
+  <p class="muted">Upload PDF/PNG/JPG and render parsed transactions table from <code>/parse-bank-statement</code>.</p>
+  <form id="f">
+    <label>Bearer token: <input id="token" style="width:420px" /></label><br/><br/>
+    <input type="file" id="file" required />
+    <button type="submit">Parse</button>
+  </form>
+  <div id="summary" class="muted"></div>
+  <table id="tbl" hidden>
+    <thead><tr>
+      <th>Date</th><th>Type</th><th>Amount</th><th>Payee/Payer</th><th>Transaction Description</th><th>Original Source Text</th><th>Reference</th><th>Confidence</th>
+    </tr></thead>
+    <tbody></tbody>
+  </table>
+  <h4>Steps/Notes</h4>
+  <pre id="meta"></pre>
+  <script>
+    const form = document.getElementById('f');
+    const tbl = document.getElementById('tbl');
+    const tbody = tbl.querySelector('tbody');
+    const summary = document.getElementById('summary');
+    const meta = document.getElementById('meta');
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      tbody.innerHTML = '';
+      tbl.hidden = true;
+      summary.textContent = 'Parsing...';
+      const fd = new FormData();
+      const file = document.getElementById('file').files[0];
+      fd.append('file', file);
+      const token = document.getElementById('token').value.trim();
+      const headers = {};
+      if (token) headers['Authorization'] = 'Bearer ' + token;
+      const res = await fetch('/parse-bank-statement', { method: 'POST', body: fd, headers });
+      const data = await res.json();
+      const tx = Array.isArray(data.transactions) ? data.transactions : [];
+      summary.textContent = `ok=${data.ok} transactions=${tx.length}`;
+      for (const t of tx) {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td>${t.date||''}</td><td>${t.type||''}</td><td>${t.amount??''}</td><td>${(t.payeePayer||'').replace(/</g,'&lt;')}</td><td>${(t.transactionDescription||t.description||'').replace(/</g,'&lt;')}</td><td>${(t.originalSourceText||'').replace(/</g,'&lt;')}</td><td>${(t.reference||'').replace(/</g,'&lt;')}</td><td>${t.confidence??''}</td>`;
+        tbody.appendChild(tr);
+      }
+      tbl.hidden = tx.length === 0;
+      meta.textContent = JSON.stringify({steps:data.steps, notes:data.notes}, null, 2);
+    });
+  </script>
+</body>
+</html>"""
+
+
+def _json_from_result(result: Any) -> Dict[str, Any]:
+    if isinstance(result, JSONResponse):
+        try:
+            return json.loads(result.body.decode("utf-8"))
+        except Exception:
+            return {"ok": False, "transactions": [], "steps": [], "notes": ["Invalid JSONResponse body"]}
+    if isinstance(result, dict):
+        return result
+    return {"ok": False, "transactions": [], "steps": [], "notes": [f"Unexpected result type: {type(result)}"]}
+
+
+@app.post("/parse-bank-statement/from-url")
+async def parse_bank_statement_from_url(
+    url: str,
+    authorization: Optional[str] = Header(default=None),
+):
+    steps: List[Dict[str, str]] = []
+    notes: List[str] = []
+    try:
+        if not url.lower().startswith(("http://", "https://")):
+            add_step(steps, "download", "failed", "URL must start with http:// or https://")
+            return build_error_response("Invalid URL.", steps, notes, status_code=400)
+
+        resp = requests.get(url, timeout=90)
+        if resp.status_code >= 400:
+            add_step(steps, "download", "failed", f"HTTP {resp.status_code}")
+            return build_error_response(f"Failed to download URL (HTTP {resp.status_code}).", steps, notes, 400)
+        content = resp.content or b""
+        if not content:
+            add_step(steps, "download", "failed", "Downloaded body is empty")
+            return build_error_response("Downloaded file is empty.", steps, notes, 400)
+        if len(content) > MAX_UPLOAD_BYTES:
+            add_step(steps, "download", "failed", f"Downloaded file exceeds {MAX_UPLOAD_MB}MB")
+            return build_error_response(f"File too large (max {MAX_UPLOAD_MB}MB).", steps, notes, 413)
+
+        parsed = urlparse(url)
+        guessed_name = os.path.basename(unquote(parsed.path)) or "downloaded.pdf"
+        guessed_type = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
+        add_step(steps, "download", "success", f"Fetched {guessed_name} ({len(content)} bytes)")
+
+        tmp = SpooledTemporaryFile(max_size=MAX_UPLOAD_BYTES)
+        tmp.write(content)
+        tmp.seek(0)
+        headers = Headers({"content-type": guessed_type or "application/octet-stream"})
+        uf = StarletteUploadFile(file=tmp, filename=guessed_name, headers=headers)
+        result = await parse_bank_statement(file=uf, authorization=authorization)
+        payload = _json_from_result(result)
+        payload_steps = payload.get("steps", [])
+        payload_steps.insert(0, {"service": "download", "status": "success", "detail": f"url={url}"})
+        payload["steps"] = payload_steps
+        return payload
+    except Exception as exc:
+        add_step(steps, "download", "failed", str(exc))
+        return build_error_response("URL parse failed.", steps, notes + [str(exc)], 500)
+
+
+@app.get("/parse-bank-statement/quick-view", response_class=HTMLResponse)
+async def parse_bank_statement_quick_view(url: str, token: Optional[str] = None) -> str:
+    auth = f"Bearer {token}" if token else None
+    result = await parse_bank_statement_from_url(url=url, authorization=auth)
+    payload = _json_from_result(result)
+    tx = payload.get("transactions", []) if isinstance(payload, dict) else []
+    rows = []
+    for t in tx[:1000]:
+        rows.append(
+            "<tr>"
+            f"<td>{t.get('date','')}</td>"
+            f"<td>{t.get('type','')}</td>"
+            f"<td>{t.get('amount','')}</td>"
+            f"<td>{str(t.get('payeePayer','')).replace('<','&lt;')}</td>"
+            f"<td>{str(t.get('transactionDescription') or t.get('description','')).replace('<','&lt;')}</td>"
+            f"<td>{str(t.get('originalSourceText','')).replace('<','&lt;')}</td>"
+            f"<td>{str(t.get('reference','')).replace('<','&lt;')}</td>"
+            f"<td>{t.get('confidence','')}</td>"
+            "</tr>"
+        )
+    meta = json.dumps({"ok": payload.get("ok"), "steps": payload.get("steps", []), "notes": payload.get("notes", [])}, indent=2)
+    return f"""<!doctype html>
+<html><head><meta charset="utf-8"/><title>TaxPig Quick View</title>
+<style>body{{font-family:Arial;margin:18px}}table{{border-collapse:collapse;width:100%}}th,td{{border:1px solid #ddd;padding:6px;font-size:12px}}th{{background:#f3f3f3}}pre{{background:#111;color:#eee;padding:8px}}</style>
+</head><body>
+<h3>Quick View: {url}</h3>
+<p>Rows shown: {len(tx)}</p>
+<table><thead><tr><th>Date</th><th>Type</th><th>Amount</th><th>Payee/Payer</th><th>Transaction Description</th><th>Original Source Text</th><th>Reference</th><th>Confidence</th></tr></thead>
+<tbody>{''.join(rows) if rows else '<tr><td colspan="8">No transactions</td></tr>'}</tbody></table>
+<h4>Steps / Notes</h4><pre>{meta}</pre>
+</body></html>"""
 
 
 @app.post("/parse-bank-statement")
@@ -646,10 +1016,10 @@ async def parse_bank_statement(
             f"transactions={len(transactions)} failed_rows={len(failed_rows)}",
         )
 
-        repaired_rows, gpt_detail = repair_rows_with_gpt_compact(
+        repaired_rows, gpt_detail, gpt_notes = repair_rows_with_gpt_compact(
             headers=["date", "description", "amount"],
-            sample_rows=raw_rows[:20],
-            failed_rows=failed_rows[:20],
+            sample_rows=raw_rows[:GPT_MAX_SAMPLE_ROWS],
+            failed_rows=failed_rows[:GPT_MAX_SAMPLE_ROWS],
         )
         if repaired_rows:
             repaired_transactions, _ = normalize_transactions(repaired_rows)
@@ -662,6 +1032,26 @@ async def parse_bank_statement(
             )
         else:
             add_step(steps, "repair_rows_with_gpt_compact", "skipped", gpt_detail)
+        if gpt_notes:
+            notes.extend(gpt_notes[:20])
+
+        low_confidence = [t for t in transactions if float(t.get("confidence") or 0) < CONFIDENCE_REVIEW_THRESHOLD]
+        if low_confidence:
+            add_step(
+                steps,
+                "confidence_scoring",
+                "success",
+                f"low_confidence={len(low_confidence)} threshold={CONFIDENCE_REVIEW_THRESHOLD}",
+            )
+        else:
+            add_step(steps, "confidence_scoring", "success", "all transactions above threshold")
+
+        gpt_val_detail, gpt_val_notes = validate_transactions_with_gpt_compact(low_confidence or transactions)
+        if gpt_val_notes:
+            notes.extend(gpt_val_notes[:20])
+            add_step(steps, "validate_transactions_with_gpt_compact", "success", gpt_val_detail)
+        else:
+            add_step(steps, "validate_transactions_with_gpt_compact", "skipped", gpt_val_detail)
 
         if ocr_pages:
             notes.append("OCR fallback pages: " + "; ".join(ocr_pages))

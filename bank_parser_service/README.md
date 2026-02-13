@@ -5,6 +5,7 @@ This service exposes:
 - `POST /parse-bank-statement`
 
 It accepts a single multipart file field named `file` and returns structured transactions with `steps` and `notes`.
+Supported uploads: `pdf`, `png`, `jpg`, `jpeg` (PDF-first, OCR fallback).
 
 ## Run locally
 
@@ -36,3 +37,13 @@ curl -X POST "http://localhost:8000/parse-bank-statement" \
 - Uses `pdfplumber` first for digital PDFs.
 - OCR is page-level fallback only when page quality checks fail.
 - GPT repair function is compact-policy ready and currently conservative (skips by default).
+- For image files, OCR is used directly.
+
+## Batch test helper
+
+Run all files in `testfiles/` and print a summary:
+
+```bash
+cd bank_parser_service
+./.venv/bin/python testfiles/run_batch_eval.py
+```

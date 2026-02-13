@@ -20,18 +20,22 @@ ALLOWED_MIME_TYPES = {
     "application/x-pdf",
     "application/octet-stream",
 }
-ALLOWED_EXTENSIONS = {".pdf"}
+ALLOWED_IMAGE_MIME_TYPES = {"image/png", "image/jpeg", "image/jpg"}
+ALLOWED_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg"}
 EXPECTED_BEARER = os.getenv("BANK_PARSER_BEARER_TOKEN") or os.getenv(
     "RAILWAY_BANK_PARSER_BEARER_TOKEN"
 )
 OCR_DPI = int(os.getenv("OCR_DPI", "250"))
 MIN_WORDS_PER_PAGE = int(os.getenv("MIN_WORDS_PER_PAGE", "25"))
+MAX_ROW_VERTICAL_GAP = float(os.getenv("MAX_ROW_VERTICAL_GAP", "18"))
 
 DATE_REGEX = re.compile(
-    r"\b(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{2,4})\b"
+    r"\b(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{2,4}|[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{2,4})\b"
 )
-AMOUNT_REGEX = re.compile(r"[-(]?\d{1,3}(?:,\d{3})*(?:\.\d{2})\)?")
-ROW_REGEX = r"(?P<date>\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{2,4}).*?(?P<amount>[-(]?\d{1,3}(?:,\d{3})*(?:\.\d{2})\)?)"
+AMOUNT_REGEX = re.compile(
+    r"(?:£|\$|€)?\s*[-(]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{2})\)?(?:\s*(?:CR|DR))?"
+)
+ROW_REGEX = r"(?P<date>\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{2,4}).*?(?P<amount>[-(]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{2})\)?)"
 
 
 class Step(BaseModel):
@@ -94,6 +98,10 @@ def parse_date(value: str) -> Optional[str]:
         "%d %b %y",
         "%d %B %Y",
         "%d %B %y",
+        "%b %d %Y",
+        "%b %d, %Y",
+        "%B %d %Y",
+        "%B %d, %Y",
     ]
     for fmt in fmts:
         try:
@@ -107,8 +115,11 @@ def parse_amount(value: str) -> Optional[float]:
     if not value:
         return None
     s = value.replace(",", "").strip()
-    is_negative = s.startswith("(") or s.startswith("-") or s.endswith("DR")
+    s = s.replace("£", "").replace("$", "").replace("€", "")
+    is_negative = s.startswith("(") or s.startswith("-") or s.endswith("DR") or s.endswith("-")
     s = s.replace("(", "").replace(")", "").replace("CR", "").replace("DR", "").strip()
+    if s.endswith("-"):
+        s = s[:-1].strip()
     try:
         val = float(s)
         return -abs(val) if is_negative else val
@@ -200,6 +211,78 @@ def _group_words_into_lines(words: List[Dict[str, Any]], y_tol: float = 3.0) -> 
     return lines
 
 
+def _line_text(line_words: List[Dict[str, Any]]) -> str:
+    return " ".join(
+        str(w.get("text", "")).strip() for w in sorted(line_words, key=lambda w: float(w.get("x0", 0)))
+        if str(w.get("text", "")).strip()
+    )
+
+
+def _line_top(line_words: List[Dict[str, Any]]) -> float:
+    return min(float(w.get("top", 0)) for w in line_words) if line_words else 0.0
+
+
+def _is_probable_header(line_text: str) -> bool:
+    t = line_text.lower()
+    header_tokens = [
+        "balance",
+        "statement",
+        "page",
+        "sort code",
+        "account number",
+        "transactions",
+        "description",
+        "reference",
+        "debit",
+        "credit",
+    ]
+    return any(tok in t for tok in header_tokens) and not DATE_REGEX.search(line_text)
+
+
+def _is_summary_non_transaction_line(line_text: str) -> bool:
+    t = line_text.lower()
+    if t.startswith("opening balance") or t.startswith("closing balance"):
+        return True
+    if t.startswith("balance on "):
+        return True
+    if t.startswith("money in") or t.startswith("money out"):
+        return True
+    if "statement date" in t or "sort code" in t or "account number" in t:
+        return True
+    return False
+
+
+def _choose_primary_amount(amount_matches: List[str], line_text: str) -> str:
+    if not amount_matches:
+        return ""
+    cleaned: List[str] = []
+    for m in amount_matches:
+        s = " ".join(str(m).split())
+        if s and s not in cleaned:
+            cleaned.append(s)
+    if not cleaned:
+        return ""
+
+    signed = [x for x in cleaned if "-" in x or "(" in x or "DR" in x.upper()]
+    if signed:
+        return signed[0]
+
+    if "balance" in line_text.lower() and len(cleaned) >= 2:
+        scored: List[Tuple[float, str]] = []
+        for token in cleaned:
+            parsed = parse_amount(token)
+            if parsed is not None:
+                scored.append((abs(parsed), token))
+        if scored:
+            scored.sort(key=lambda x: x[0])
+            return scored[0][1]
+
+    # Common bank layout: transaction amount appears before running balance.
+    if len(cleaned) >= 2:
+        return cleaned[0]
+    return cleaned[0]
+
+
 def reconstruct_rows_geometric(page_data: Dict[str, Any], source: str = "pdfplumber") -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     page_number = page_data.get("pageNumber", 0)
@@ -219,52 +302,109 @@ def reconstruct_rows_geometric(page_data: Dict[str, Any], source: str = "pdfplum
             date_match = DATE_REGEX.search(joined)
             amount_matches = AMOUNT_REGEX.findall(joined)
             if date_match and amount_matches:
+                if _is_summary_non_transaction_line(joined):
+                    continue
                 rows.append(
                     {
                         "source": source,
                         "pageNumber": page_number,
                         "dateRaw": date_match.group(1),
-                        "amountRaw": amount_matches[-1],
+                        "amountRaw": _choose_primary_amount(amount_matches, joined),
                         "descriptionRaw": joined,
                         "referenceRaw": "",
                     }
                 )
 
-    # Geometric line reconstruction from words.
+    # Geometric line reconstruction from words (layout-agnostic).
     lines = _group_words_into_lines(words)
     current_row: Optional[Dict[str, Any]] = None
+    pending_date_row: Optional[Dict[str, Any]] = None
+    pending_date_top: float = -1.0
+
     for line in lines:
         line_sorted = sorted(line, key=lambda w: float(w.get("x0", 0)))
-        line_text = " ".join(str(w.get("text", "")).strip() for w in line_sorted if str(w.get("text", "")).strip())
+        line_text = _line_text(line_sorted)
         if not line_text:
+            continue
+        if _is_probable_header(line_text):
             continue
 
         date_match = DATE_REGEX.search(line_text)
         right_side = [w for w in line_sorted if float(w.get("x0", 0)) > (width * 0.62)]
-        right_text = " ".join(str(w.get("text", "")).strip() for w in right_side if str(w.get("text", "")).strip())
-        amount_matches = AMOUNT_REGEX.findall(right_text) or AMOUNT_REGEX.findall(line_text)
+        right_text = _line_text(right_side)
+        line_amounts = AMOUNT_REGEX.findall(line_text)
+        right_amounts = AMOUNT_REGEX.findall(right_text)
+        if "balance" in line_text.lower() and len(line_amounts) >= 2:
+            amount_matches = line_amounts
+        else:
+            amount_matches = right_amounts or line_amounts
+        line_top = _line_top(line_sorted)
 
         if date_match and amount_matches:
+            if _is_summary_non_transaction_line(line_text):
+                continue
             if current_row:
                 rows.append(current_row)
             current_row = {
                 "source": source,
                 "pageNumber": page_number,
                 "dateRaw": date_match.group(1),
-                "amountRaw": amount_matches[-1],
+                "amountRaw": _choose_primary_amount(amount_matches, line_text),
                 "descriptionRaw": line_text,
                 "referenceRaw": "",
             }
+            pending_date_row = None
             continue
 
-        # Continuation line (split layouts: description block separate from money block).
-        if current_row and not DATE_REGEX.search(line_text):
+        # Date in one line/column, amount in another nearby line/column.
+        if date_match and not amount_matches:
+            pending_date_row = {
+                "source": source,
+                "pageNumber": page_number,
+                "dateRaw": date_match.group(1),
+                "amountRaw": "",
+                "descriptionRaw": line_text,
+                "referenceRaw": "",
+            }
+            pending_date_top = line_top
+            if current_row:
+                rows.append(current_row)
+                current_row = None
+            continue
+
+        if amount_matches and pending_date_row:
+            if abs(line_top - pending_date_top) <= MAX_ROW_VERTICAL_GAP:
+                combined = dict(pending_date_row)
+                combined["amountRaw"] = amount_matches[-1]
+                combined["descriptionRaw"] = f"{pending_date_row['descriptionRaw']} {line_text}".strip()
+                rows.append(combined)
+                pending_date_row = None
+                pending_date_top = -1.0
+                continue
+
+        # Continuation line for the active row.
+        if current_row and not date_match and not amount_matches:
             current_row["descriptionRaw"] = f"{current_row['descriptionRaw']} {line_text}".strip()
 
     if current_row:
         rows.append(current_row)
 
-    return rows
+    # Deduplicate by stable composite key.
+    deduped: List[Dict[str, Any]] = []
+    seen = set()
+    for row in rows:
+        k = (
+            row.get("pageNumber"),
+            (row.get("dateRaw") or "").strip(),
+            (row.get("amountRaw") or "").strip(),
+            " ".join((row.get("descriptionRaw") or "").split())[:120].lower(),
+        )
+        if k in seen:
+            continue
+        seen.add(k)
+        deduped.append(row)
+
+    return deduped
 
 
 def ocr_page_if_needed(pdf_bytes: bytes, page_number: int, reasons: List[str]) -> Tuple[List[Dict[str, Any]], str]:
@@ -325,6 +465,44 @@ def ocr_page_if_needed(pdf_bytes: bytes, page_number: int, reasons: List[str]) -
         return [], f"ocr_failed:{exc}"
 
 
+def ocr_image_file(image_bytes: bytes) -> Tuple[List[Dict[str, Any]], str]:
+    try:
+        import pytesseract
+        from pytesseract import Output
+        from PIL import Image
+    except Exception as exc:
+        return [], f"ocr_unavailable:{exc}"
+
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        ocr = pytesseract.image_to_data(img, output_type=Output.DICT)
+        words: List[Dict[str, Any]] = []
+        n = len(ocr.get("text", []))
+        extracted_words = 0
+        for i in range(n):
+            txt = (ocr.get("text", [""])[i] or "").strip()
+            conf = float(ocr.get("conf", ["-1"])[i] or -1)
+            if not txt or conf < 35:
+                continue
+            left = float(ocr.get("left", [0])[i])
+            top = float(ocr.get("top", [0])[i])
+            w = float(ocr.get("width", [0])[i])
+            h = float(ocr.get("height", [0])[i])
+            words.append({"text": txt, "x0": left, "x1": left + w, "top": top, "bottom": top + h})
+            extracted_words += 1
+        page_data = {
+            "pageNumber": 1,
+            "width": float(getattr(img, "width", 0)),
+            "height": float(getattr(img, "height", 0)),
+            "words": words,
+            "tables": [],
+            "text": " ".join(w["text"] for w in words),
+        }
+        return reconstruct_rows_geometric(page_data, source="ocr_image"), f"ocr_image_words={extracted_words}"
+    except Exception as exc:
+        return [], f"ocr_image_failed:{exc}"
+
+
 def repair_rows_with_gpt_compact(
     headers: List[str],
     sample_rows: List[Dict[str, Any]],
@@ -344,6 +522,9 @@ def normalize_transactions(raw_rows: List[Dict[str, Any]]) -> Tuple[List[Dict[st
         date_value = parse_date(str(row.get("dateRaw", "")).strip())
         amount_value = parse_amount(str(row.get("amountRaw", "")).strip())
         description = " ".join(str(row.get("descriptionRaw", "")).split())
+        if _is_summary_non_transaction_line(description):
+            failed.append(row)
+            continue
         if not date_value or amount_value is None or not description:
             failed.append(row)
             continue
@@ -351,9 +532,18 @@ def normalize_transactions(raw_rows: List[Dict[str, Any]]) -> Tuple[List[Dict[st
         ref_match = re.search(r"\b(ref(?:erence)?[:\s-]*[A-Z0-9-]{4,})\b", description, re.I)
         if ref_match:
             reference = ref_match.group(1).strip()
+        d = description.lower()
+        if amount_value < 0:
+            tx_type = "expense"
+        elif re.search(r"\bdeb(it)?\b|\bdr\b|money out|withdrawal|card|purchase|payment to|transfer out", d):
+            tx_type = "expense"
+        elif re.search(r"\bcr\b|credit|money in|salary|refund|interest|reward|transfer in", d):
+            tx_type = "income"
+        else:
+            tx_type = "income"
         tx = {
             "id": str(uuid.uuid4()),
-            "type": "income" if amount_value > 0 else "expense",
+            "type": tx_type,
             "date": date_value,
             "payeePayer": description[:120],
             "description": description,
@@ -388,8 +578,9 @@ async def parse_bank_statement(
         mime = (file.content_type or "").lower()
         if ext not in ALLOWED_EXTENSIONS:
             add_step(steps, "validation", "failed", f"Invalid extension: {ext}")
-            return build_error_response("Only PDF files are accepted.", steps, notes, status_code=400)
-        if mime and mime not in ALLOWED_MIME_TYPES:
+            return build_error_response("Only PDF/PNG/JPG files are accepted.", steps, notes, status_code=400)
+        allowed_mimes = ALLOWED_MIME_TYPES.union(ALLOWED_IMAGE_MIME_TYPES)
+        if mime and mime not in allowed_mimes:
             add_step(steps, "validation", "failed", f"Invalid content type: {mime}")
             return build_error_response("Unsupported content type.", steps, notes, status_code=400)
 
@@ -404,39 +595,47 @@ async def parse_bank_statement(
             )
         add_step(steps, "validation", "success", f"Accepted {filename} ({len(pdf_bytes)} bytes).")
 
-        pages = extract_pdfplumber_pages(pdf_bytes)
-        add_step(steps, "pdfplumber", "success", f"Extracted {len(pages)} pages.")
-
         raw_rows: List[Dict[str, Any]] = []
         ocr_pages: List[str] = []
-        for page_data in pages:
-            page_number = int(page_data["pageNumber"])
-            reconstructed_text_chunks.append(page_data.get("text", ""))
-            ok, reasons = quality_assess_page(page_data)
-            if ok:
-                page_rows = reconstruct_rows_geometric(page_data, source="pdfplumber")
-                raw_rows.extend(page_rows)
-                add_step(
-                    steps,
-                    "quality_assess_page",
-                    "success",
-                    f"page={page_number} pdfplumber_ok rows={len(page_rows)}",
-                )
-            else:
-                add_step(
-                    steps,
-                    "quality_assess_page",
-                    "failed",
-                    f"page={page_number} reasons={','.join(reasons)}",
-                )
-                ocr_rows, ocr_detail = ocr_page_if_needed(pdf_bytes, page_number, reasons)
-                if ocr_rows:
-                    raw_rows.extend(ocr_rows)
-                    ocr_pages.append(f"page {page_number}: {ocr_detail}")
-                    add_step(steps, "ocr_page_if_needed", "success", ocr_detail)
+        if ext == ".pdf":
+            pages = extract_pdfplumber_pages(pdf_bytes)
+            add_step(steps, "pdfplumber", "success", f"Extracted {len(pages)} pages.")
+            for page_data in pages:
+                page_number = int(page_data["pageNumber"])
+                reconstructed_text_chunks.append(page_data.get("text", ""))
+                ok, reasons = quality_assess_page(page_data)
+                if ok:
+                    page_rows = reconstruct_rows_geometric(page_data, source="pdfplumber")
+                    raw_rows.extend(page_rows)
+                    add_step(
+                        steps,
+                        "quality_assess_page",
+                        "success",
+                        f"page={page_number} pdfplumber_ok rows={len(page_rows)}",
+                    )
                 else:
-                    notes.append(f"OCR skipped/failed for page {page_number}: {ocr_detail}")
-                    add_step(steps, "ocr_page_if_needed", "failed", ocr_detail)
+                    add_step(
+                        steps,
+                        "quality_assess_page",
+                        "failed",
+                        f"page={page_number} reasons={','.join(reasons)}",
+                    )
+                    ocr_rows, ocr_detail = ocr_page_if_needed(pdf_bytes, page_number, reasons)
+                    if ocr_rows:
+                        raw_rows.extend(ocr_rows)
+                        ocr_pages.append(f"page {page_number}: {ocr_detail}")
+                        add_step(steps, "ocr_page_if_needed", "success", ocr_detail)
+                    else:
+                        notes.append(f"OCR skipped/failed for page {page_number}: {ocr_detail}")
+                        add_step(steps, "ocr_page_if_needed", "failed", ocr_detail)
+        else:
+            ocr_rows, ocr_detail = ocr_image_file(pdf_bytes)
+            if ocr_rows:
+                raw_rows.extend(ocr_rows)
+                add_step(steps, "ocr_image_file", "success", ocr_detail)
+            else:
+                add_step(steps, "ocr_image_file", "failed", ocr_detail)
+                notes.append(f"Image OCR failed: {ocr_detail}")
 
         add_step(steps, "reconstruct_rows_geometric", "success", f"raw_rows={len(raw_rows)}")
         transactions, failed_rows = normalize_transactions(raw_rows)

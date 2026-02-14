@@ -290,46 +290,98 @@ def reconstruct_rows_statement_columns(page_data: Dict[str, Any], source: str) -
 
     out_x, in_x, bal_x = _infer_amount_column_centers(words, width)
 
-    lines = _group_words_into_lines(words, y_tol=4.0)
+    # Anchor-based row splitting: each payment-type token becomes a row anchor.
+    anchors: List[Dict[str, Any]] = []
+    for w in words:
+        txt = str(w.get("text", "")).strip()
+        if not txt:
+            continue
+        if PAYMENT_TYPE_REGEX.fullmatch(txt):
+            anchors.append({"top": float(w.get("top", 0)), "kind": "ptype", "value": txt.upper()})
+            continue
+        # Contactless markers are often OCR'd as ')', '))', or ')))'
+        if txt in (")", "))", ")))"):
+            x0 = float(w.get("x0", 0))
+            if x0 < width * 0.45:
+                anchors.append({"top": float(w.get("top", 0)), "kind": "ptype", "value": "CONTACTLESS"})
+            continue
+        # Amount anchors (paid-out/paid-in columns) are more reliable than payment type tokens.
+        if _is_amount_token(txt):
+            cx = (float(w.get("x0", 0)) + float(w.get("x1", 0))) / 2.0
+            nearest = min(
+                [("out", out_x), ("in", in_x), ("bal", bal_x)],
+                key=lambda kv: abs(cx - kv[1]),
+            )[0]
+            if nearest in ("out", "in"):
+                anchors.append({"top": float(w.get("top", 0)), "kind": "amount", "value": nearest})
+            elif nearest == "bal":
+                anchors.append({"top": float(w.get("top", 0)), "kind": "balance_amt", "value": "bal"})
+
+    # Add explicit balance anchors if present.
+    full_text = (page_data.get("text") or "").lower()
+    if "balance brought forward" in full_text or "balance carried forward" in full_text:
+        # We'll still detect via band text, but ensure there is an anchor near the first occurrence.
+        for w in words:
+            if str(w.get("text", "")).lower() == "balance":
+                anchors.append({"top": float(w.get("top", 0)), "kind": "balance", "value": "BALANCE"})
+                break
+
+    # De-dupe anchors by y proximity.
+    anchors = sorted(anchors, key=lambda a: a["top"])
+    dedup = []
+    for a in anchors:
+        if not dedup or abs(a["top"] - dedup[-1]["top"]) > 3:
+            dedup.append(a)
+    anchors = dedup
+    if len(anchors) < 3:
+        # Fallback to generic line-based parse for sparse OCR.
+        lines = _group_words_into_lines(words, y_tol=9.0)
+        for line in lines:
+            text = _line_text(line)
+            if text:
+                pass
+        return rows
+
     current_date = ""
-    current_row: Optional[Dict[str, Any]] = None
-
-    def flush():
-        nonlocal current_row
-        if current_row:
-            rows.append(current_row)
-            current_row = None
-
-    for line in lines:
-        line_sorted = sorted(line, key=lambda w: float(w.get("x0", 0)))
-        text = _line_text(line_sorted)
-        if not text:
+    for i, a in enumerate(anchors):
+        top = float(a["top"])
+        next_top = float(anchors[i + 1]["top"]) if i + 1 < len(anchors) else 1e9
+        band_words = [w for w in words if top - 10 <= float(w.get("top", 0)) < next_top - 3]
+        if not band_words:
             continue
-
-        # Ignore obvious header area.
-        if _is_probable_header(text) or "account details" in text.lower():
+        band_sorted = sorted(band_words, key=lambda w: float(w.get("x0", 0)))
+        band_text = _words_to_text_yx(band_words)
+        if not band_text:
             continue
+        # Balance lines include the word "Balance" and would look like headers otherwise.
+        if "balance brought forward" not in band_text.lower() and "balance carried forward" not in band_text.lower():
+            if _is_probable_header(band_text):
+                continue
 
-        date_match = DATE_REGEX.search(text)
+        date_match = DATE_REGEX.search(band_text)
         if date_match:
             current_date = date_match.group(1)
 
-        pt_match = PAYMENT_TYPE_REGEX.search(text)
-        payment_type = (pt_match.group(1).upper() if pt_match else "").strip()
-        # Common OCR artifact for contactless in this statement.
-        if not payment_type and ")))" in text:
-            payment_type = "CONTACTLESS"
+        # Determine payment type from band content (more robust than anchor value).
+        payment_type = "UNK"
+        for w in band_words:
+            t = str(w.get("text", "")).strip()
+            if PAYMENT_TYPE_REGEX.fullmatch(t):
+                payment_type = t.upper()
+                break
+        if payment_type == "UNK":
+            if any(str(w.get("text", "")).strip() in (")", "))", ")))") and float(w.get("x0", 0)) < width * 0.45 for w in band_words):
+                payment_type = "CONTACTLESS"
 
-        # Amount tokens w/ columns by x-position.
+        # Amounts by column.
         paid_out_raw = ""
         paid_in_raw = ""
         balance_raw = ""
-        for w in line_sorted:
+        for w in band_sorted:
             wt = str(w.get("text", "")).strip()
             if not _is_amount_token(wt):
                 continue
             cx = (float(w.get("x0", 0)) + float(w.get("x1", 0))) / 2.0
-            # nearest column
             nearest = min(
                 [("out", out_x), ("in", in_x), ("bal", bal_x)],
                 key=lambda kv: abs(cx - kv[1]),
@@ -341,39 +393,52 @@ def reconstruct_rows_statement_columns(page_data: Dict[str, Any], source: str) -
             else:
                 balance_raw = wt
 
-        # Balance lines
-        if "balance brought forward" in text.lower() or "balance carried forward" in text.lower():
-            flush()
-            desc = "Balance brought forward" if "brought" in text.lower() else "Balance carried forward"
+        if "balance brought forward" in band_text.lower():
             rows.append(
                 {
                     "source": source,
                     "pageNumber": page_number,
-                    "dateRaw": current_date or (date_match.group(1) if date_match else ""),
+                    "dateRaw": current_date,
                     "paymentType": "BALANCE",
-                    "descriptionRaw": desc,
+                    "descriptionRaw": "Balance brought forward",
                     "paidOutRaw": "",
                     "paidInRaw": "",
-                    "balanceRaw": balance_raw or (AMOUNT_REGEX.findall(text)[-1] if AMOUNT_REGEX.findall(text) else ""),
+                    "balanceRaw": balance_raw,
+                    "originalSourceText": band_text,
+                    "_yTop": top,
+                }
+            )
+            continue
+        if "balance carried forward" in band_text.lower():
+            rows.append(
+                {
+                    "source": source,
+                    "pageNumber": page_number,
+                    "dateRaw": current_date,
+                    "paymentType": "BALANCE",
+                    "descriptionRaw": "Balance carried forward",
+                    "paidOutRaw": "",
+                    "paidInRaw": "",
+                    "balanceRaw": balance_raw,
+                    "originalSourceText": band_text,
+                    "_yTop": top,
                 }
             )
             continue
 
-        # Start a new transaction row when payment type exists OR we have an amount and a date.
-        is_row_start = bool(payment_type) or (bool(date_match) and (paid_out_raw or paid_in_raw))
-        if is_row_start:
-            flush()
-            # Extract details text: strip date + payment type + numeric tokens.
-            details = text
-            if current_date:
-                details = re.sub(re.escape(current_date), " ", details, count=1)
-            if payment_type:
-                details = re.sub(rf"\\b{re.escape(payment_type)}\\b", " ", details, count=1, flags=re.I)
-            details = re.sub(r"\\b\\d{1,3}(?:,\\d{3})*\\.\\d{2}\\b", " ", details)
-            details = _strip_noise_tokens(details)
-            if not details and payment_type:
-                details = payment_type
-            current_row = {
+        # Details: strip date + payment type + numeric tokens.
+        details = band_text
+        if current_date:
+            details = re.sub(re.escape(current_date), " ", details, count=1)
+        if payment_type and payment_type != "CONTACTLESS":
+            details = re.sub(rf"\\b{re.escape(payment_type)}\\b", " ", details, count=1, flags=re.I)
+        if payment_type == "CONTACTLESS":
+            details = details.replace(")))", " ")
+        details = re.sub(r"\\b\\d{1,3}(?:,\\d{3})*\\.\\d{2}\\b", " ", details)
+        details = _strip_noise_tokens(details)
+
+        rows.append(
+            {
                 "source": source,
                 "pageNumber": page_number,
                 "dateRaw": current_date,
@@ -382,22 +447,14 @@ def reconstruct_rows_statement_columns(page_data: Dict[str, Any], source: str) -
                 "paidOutRaw": paid_out_raw,
                 "paidInRaw": paid_in_raw,
                 "balanceRaw": balance_raw,
+                "originalSourceText": band_text,
+                "_yTop": top,
             }
-            continue
+        )
 
-        # Continuation line (details wraps).
-        if current_row:
-            cont = text
-            if current_date:
-                cont = re.sub(re.escape(current_date), " ", cont, count=1)
-            cont = re.sub(r"\\b\\d{1,3}(?:,\\d{3})*\\.\\d{2}\\b", " ", cont)
-            cont = _strip_noise_tokens(cont)
-            if cont:
-                current_row["descriptionRaw"] = " ".join(
-                    f"{current_row.get('descriptionRaw','')} {cont}".split()
-                )
-
-    flush()
+    rows = _merge_statement_rows(rows)
+    for r in rows:
+        r.pop("_yTop", None)
     return rows
 
 
@@ -406,6 +463,75 @@ def _line_text(line_words: List[Dict[str, Any]]) -> str:
         str(w.get("text", "")).strip() for w in sorted(line_words, key=lambda w: float(w.get("x0", 0)))
         if str(w.get("text", "")).strip()
     )
+
+
+def _words_to_text_yx(words: List[Dict[str, Any]]) -> str:
+    return " ".join(
+        str(w.get("text", "")).strip()
+        for w in sorted(words, key=lambda w: (float(w.get("top", 0)), float(w.get("x0", 0))))
+        if str(w.get("text", "")).strip()
+    )
+
+
+def _merge_statement_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Merge OCR-split table rows.
+
+    Common OCR pattern on scanned statements:
+    - Row A: paymentType + merchant (no amount)
+    - Row B: location/continuation + amount (UNK paymentType)
+    These are the same transaction; merge them.
+    """
+    merged: List[Dict[str, Any]] = []
+    i = 0
+    while i < len(rows):
+        r = rows[i]
+        if i + 1 < len(rows):
+            n = rows[i + 1]
+            r_pt = str(r.get("paymentType") or "").strip().upper()
+            n_pt = str(n.get("paymentType") or "").strip().upper()
+            r_has_amt = bool(r.get("paidOutRaw") or r.get("paidInRaw"))
+            n_has_amt = bool(n.get("paidOutRaw") or n.get("paidInRaw"))
+            same_date = (r.get("dateRaw") or "") == (n.get("dateRaw") or "")
+            close_y = abs(float(r.get("_yTop", 0)) - float(n.get("_yTop", 0))) <= 45
+
+            if (
+                same_date
+                and close_y
+                and r_pt not in ("", "UNK", "BALANCE")
+                and not r_has_amt
+                and n_pt in ("", "UNK")
+                and n_has_amt
+            ):
+                r["descriptionRaw"] = " ".join(f"{r.get('descriptionRaw','')} {n.get('descriptionRaw','')}".split())
+                r["originalSourceText"] = " ".join(
+                    f"{r.get('originalSourceText','')} {n.get('originalSourceText','')}".split()
+                ).strip()
+                for k in ("paidOutRaw", "paidInRaw", "balanceRaw"):
+                    if not r.get(k) and n.get(k):
+                        r[k] = n.get(k)
+                merged.append(r)
+                i += 2
+                continue
+
+        merged.append(r)
+        i += 1
+
+    # Propagate payment type when OCR misses it (common on scanned tables).
+    for j in range(1, len(merged)):
+        cur = merged[j]
+        prev = merged[j - 1]
+        cur_pt = str(cur.get("paymentType") or "").strip().upper()
+        prev_pt = str(prev.get("paymentType") or "").strip().upper()
+        if cur_pt not in ("", "UNK") or prev_pt in ("", "UNK", "BALANCE"):
+            continue
+        if (cur.get("dateRaw") or "") != (prev.get("dateRaw") or ""):
+            continue
+        if abs(float(cur.get("_yTop", 0)) - float(prev.get("_yTop", 0))) > 70:
+            continue
+        cur["paymentType"] = prev_pt
+
+    return merged
 
 
 def _line_top(line_words: List[Dict[str, Any]]) -> float:
@@ -916,6 +1042,29 @@ def normalize_transactions(raw_rows: List[Dict[str, Any]]) -> Tuple[List[Dict[st
         paid_in = parse_amount(str(row.get("paidInRaw", "")).strip()) if row.get("paidInRaw") else None
         balance = parse_amount(str(row.get("balanceRaw", "")).strip()) if row.get("balanceRaw") else None
 
+        # Balance forward/carry rows are useful even without a transaction amount.
+        if (payment_type or "").upper() == "BALANCE" and date_value and balance is not None:
+            desc = str(row.get("descriptionRaw") or "Balance").strip()
+            tx = {
+                "id": str(uuid.uuid4()),
+                "type": "income",
+                "date": date_value,
+                "payeePayer": "Balance",
+                "description": desc,
+                "transactionDescription": desc,
+                "originalSourceText": " ".join(str(row.get("originalSourceText") or "").split()),
+                "paymentType": "BALANCE",
+                "paidOutGbp": None,
+                "paidInGbp": None,
+                "balanceGbp": balance,
+                "reference": "",
+                "amount": 0.0,
+                "category": "Bank statement import",
+                "confidence": 0.95,
+            }
+            transactions.append(tx)
+            continue
+
         # Primary amount used for income/expense classification.
         amount_value = None
         if paid_out is not None and paid_out != 0:
@@ -999,7 +1148,7 @@ def parse_bank_statement_viewer() -> str:
   <div id="summary" class="muted"></div>
   <table id="tbl" hidden>
     <thead><tr>
-      <th>Date</th><th>Type</th><th>Amount</th><th>Payee/Payer</th><th>Transaction Description</th><th>Original Source Text</th><th>Reference</th><th>Confidence</th>
+      <th>Date</th><th>Payment Type</th><th>Paid out</th><th>Paid in</th><th>Balance</th><th>Type</th><th>Amount</th><th>Payee/Payer</th><th>Transaction Description</th><th>Original Source Text</th><th>Reference</th><th>Confidence</th>
     </tr></thead>
     <tbody></tbody>
   </table>
@@ -1028,7 +1177,7 @@ def parse_bank_statement_viewer() -> str:
       summary.textContent = `ok=${data.ok} transactions=${tx.length}`;
       for (const t of tx) {
         const tr = document.createElement('tr');
-        tr.innerHTML = `<td>${t.date||''}</td><td>${t.type||''}</td><td>${t.amount??''}</td><td>${(t.payeePayer||'').replace(/</g,'&lt;')}</td><td>${(t.transactionDescription||t.description||'').replace(/</g,'&lt;')}</td><td>${(t.originalSourceText||'').replace(/</g,'&lt;')}</td><td>${(t.reference||'').replace(/</g,'&lt;')}</td><td>${t.confidence??''}</td>`;
+        tr.innerHTML = `<td>${t.date||''}</td><td>${t.paymentType||''}</td><td>${t.paidOutGbp??''}</td><td>${t.paidInGbp??''}</td><td>${t.balanceGbp??''}</td><td>${t.type||''}</td><td>${t.amount??''}</td><td>${(t.payeePayer||'').replace(/</g,'&lt;')}</td><td>${(t.transactionDescription||t.description||'').replace(/</g,'&lt;')}</td><td>${(t.originalSourceText||'').replace(/</g,'&lt;')}</td><td>${(t.reference||'').replace(/</g,'&lt;')}</td><td>${t.confidence??''}</td>`;
         tbody.appendChild(tr);
       }
       tbl.hidden = tx.length === 0;
@@ -1048,6 +1197,27 @@ def _json_from_result(result: Any) -> Dict[str, Any]:
     if isinstance(result, dict):
         return result
     return {"ok": False, "transactions": [], "steps": [], "notes": [f"Unexpected result type: {type(result)}"]}
+
+
+def _transactions_to_statement_csv(transactions: List[Dict[str, Any]]) -> str:
+    import io
+    import csv
+
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["date", "payment_type", "description", "paid_out_gbp", "paid_in_gbp", "balance_gbp"])
+    for t in transactions:
+        w.writerow(
+            [
+                t.get("date") or "",
+                t.get("paymentType") or "",
+                t.get("transactionDescription") or t.get("description") or "",
+                "" if t.get("paidOutGbp") is None else f"{t.get('paidOutGbp'):.2f}",
+                "" if t.get("paidInGbp") is None else f"{t.get('paidInGbp'):.2f}",
+                "" if t.get("balanceGbp") is None else f"{t.get('balanceGbp'):.2f}",
+            ]
+        )
+    return buf.getvalue()
 
 
 @app.post("/parse-bank-statement/from-url")
@@ -1086,6 +1256,8 @@ async def parse_bank_statement_from_url(
         uf = StarletteUploadFile(file=tmp, filename=guessed_name, headers=headers)
         result = await parse_bank_statement(file=uf, authorization=authorization)
         payload = _json_from_result(result)
+        if isinstance(payload, dict) and "transactions" in payload:
+            payload["statementCsv"] = _transactions_to_statement_csv(list(payload.get("transactions") or []))
         payload_steps = payload.get("steps", [])
         payload_steps.insert(0, {"service": "download", "status": "success", "detail": f"url={url}"})
         payload["steps"] = payload_steps
@@ -1106,6 +1278,10 @@ async def parse_bank_statement_quick_view(url: str, token: Optional[str] = None)
         rows.append(
             "<tr>"
             f"<td>{t.get('date','')}</td>"
+            f"<td>{t.get('paymentType','')}</td>"
+            f"<td>{t.get('paidOutGbp','')}</td>"
+            f"<td>{t.get('paidInGbp','')}</td>"
+            f"<td>{t.get('balanceGbp','')}</td>"
             f"<td>{t.get('type','')}</td>"
             f"<td>{t.get('amount','')}</td>"
             f"<td>{str(t.get('payeePayer','')).replace('<','&lt;')}</td>"
@@ -1116,14 +1292,16 @@ async def parse_bank_statement_quick_view(url: str, token: Optional[str] = None)
             "</tr>"
         )
     meta = json.dumps({"ok": payload.get("ok"), "steps": payload.get("steps", []), "notes": payload.get("notes", [])}, indent=2)
+    csv_text = str(payload.get("statementCsv") or "")
     return f"""<!doctype html>
 <html><head><meta charset="utf-8"/><title>TaxPig Quick View</title>
 <style>body{{font-family:Arial;margin:18px}}table{{border-collapse:collapse;width:100%}}th,td{{border:1px solid #ddd;padding:6px;font-size:12px}}th{{background:#f3f3f3}}pre{{background:#111;color:#eee;padding:8px}}</style>
 </head><body>
 <h3>Quick View: {url}</h3>
 <p>Rows shown: {len(tx)}</p>
-<table><thead><tr><th>Date</th><th>Type</th><th>Amount</th><th>Payee/Payer</th><th>Transaction Description</th><th>Original Source Text</th><th>Reference</th><th>Confidence</th></tr></thead>
-<tbody>{''.join(rows) if rows else '<tr><td colspan="8">No transactions</td></tr>'}</tbody></table>
+<table><thead><tr><th>Date</th><th>Payment Type</th><th>Paid out</th><th>Paid in</th><th>Balance</th><th>Type</th><th>Amount</th><th>Payee/Payer</th><th>Transaction Description</th><th>Original Source Text</th><th>Reference</th><th>Confidence</th></tr></thead>
+<tbody>{''.join(rows) if rows else '<tr><td colspan="12">No transactions</td></tr>'}</tbody></table>
+<h4>Statement CSV</h4><pre>{csv_text.replace('<','&lt;')}</pre>
 <h4>Steps / Notes</h4><pre>{meta}</pre>
 </body></html>"""
 
@@ -1267,11 +1445,13 @@ async def parse_bank_statement(
             stop_regex=None,
             notes="Geometric date+amount row detection with continuation-line merge.",
         )
+        tx_dump = [Transaction(**t).model_dump() for t in transactions]
         return {
             "ok": True,
             "text": full_text if full_text else "",
             "textPreview": full_text[:2000] if full_text else "",
-            "transactions": [Transaction(**t).model_dump() for t in transactions],
+            "transactions": tx_dump,
+            "statementCsv": _transactions_to_statement_csv(tx_dump),
             "regexPlan": regex_plan.model_dump(),
             "steps": [Step(**s).model_dump() for s in steps],
             "notes": notes,

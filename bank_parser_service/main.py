@@ -1591,6 +1591,7 @@ async def parse_bank_statement_quick_view(
     vision_err = vision_payload.get("googleVisionDumpError")
     vision_dump_preview = ""
     vision_dump = vision_payload.get("googleVisionDump")
+    vision_text_dump = "(not available)"
     if vision_dump is not None:
         try:
             # Don't inline the full dump in HTML (it can be huge). Show a preview + a download link.
@@ -1598,8 +1599,36 @@ async def parse_bank_statement_quick_view(
             vision_dump_preview = blob[:20000] + ("\n... (truncated preview; use download link for full JSON)" if len(blob) > 20000 else "")
         except Exception:
             vision_dump_preview = str(vision_dump)[:20000]
+        try:
+            # Text dump straight from Vision (before any column/row parsing).
+            pages = []
+            if isinstance(vision_dump, dict):
+                pages = vision_dump.get("pages") or []
+            parts: List[str] = []
+            for p in pages if isinstance(pages, list) else []:
+                if not isinstance(p, dict):
+                    continue
+                page_number = int(p.get("pageNumber") or 0) or 0
+                dump = p.get("dump") or {}
+                txt = _vision_dump_to_page_text(dump).strip()
+                if not txt:
+                    continue
+                header = f"--- Page {page_number} ---" if page_number else "--- Page ---"
+                parts.append(f"{header}\n{txt}")
+            vision_text_dump = "\n\n".join(parts).strip()
+            if not vision_text_dump:
+                vision_text_dump = "(empty)"
+            # Avoid blowing up the HTML response on very large PDFs.
+            if len(vision_text_dump) > 120000:
+                vision_text_dump = (
+                    vision_text_dump[:120000]
+                    + "\n\n... (truncated; reduce visionMaxPages or use /parse-bank-statement/vision-dump for full JSON)"
+                )
+        except Exception as exc:
+            vision_text_dump = f"(not available: vision_text_dump_error:{exc})"
     elif vision_err:
         vision_dump_preview = f"(not available: {vision_err})"
+        vision_text_dump = f"(not available: {vision_err})"
 
     # Preserve the token for convenience in download links.
     token_q = f"&token={token}" if token else ""
@@ -1643,6 +1672,7 @@ async def parse_bank_statement_quick_view(
 <div id="vision" class="panel {vision_active}">
   <h4>Google Vision parse (visionMaxPages={int(effective_vision_max_pages)} dpi={int(visionDpi)})</h4>
   <p class="muted">Rows shown: {len(vision_tx)}</p>
+  <h4>Google Vision Text Dump</h4><pre>{vision_text_dump.replace('<','&lt;')}</pre>
   {_render_table(vision_tx)}
   <h4>Google Vision Dump (preview)</h4><pre>{vision_dump_preview.replace('<','&lt;')}</pre>
   <h4>Statement CSV</h4><pre>{vision_csv.replace('<','&lt;')}</pre>

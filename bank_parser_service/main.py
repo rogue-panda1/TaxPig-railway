@@ -17,7 +17,7 @@ from starlette.datastructures import Headers, UploadFile as StarletteUploadFile
 import requests
 
 
-app = FastAPI(title="TaxPig Bank Statement Parser", version="1.0.0")
+app = FastAPI(title="TaxPig Bank Statement Parser", version="1.0.1")
 
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "20"))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
@@ -1506,6 +1506,7 @@ async def parse_bank_statement_quick_view(
     token: Optional[str] = None,
     visionMaxPages: Optional[int] = None,
     visionDpi: int = GOOGLE_VISION_DEFAULT_DPI,
+    only: Optional[str] = None,
 ) -> str:
     auth = f"Bearer {token}" if token else None
     effective_vision_max_pages = GOOGLE_VISION_DEFAULT_MAX_PAGES if visionMaxPages is None else int(visionMaxPages)
@@ -1539,24 +1540,38 @@ async def parse_bank_statement_quick_view(
             + "</tbody></table>"
         )
 
-    # Run both parses so the UI can compare.
-    pdfplumber_result = await parse_bank_statement_from_url(
-        url=url,
-        authorization=auth,
-        includeVisionDump=False,
-        useVision=False,
-    )
-    vision_result = await parse_bank_statement_from_url(
-        url=url,
-        authorization=auth,
-        includeVisionDump=True,
-        useVision=True,
-        visionMaxPages=effective_vision_max_pages,
-        visionDpi=visionDpi,
-    )
+    only_norm = (only or "").strip().lower()
+    show_pdfplumber = only_norm in {"", "both", "all", "pdf", "pdfplumber"}
+    show_vision = only_norm in {"", "both", "all", "vision", "google", "googlevision"}
+    if only_norm == "vision":
+        show_pdfplumber = False
+        show_vision = True
+    if only_norm in {"pdf", "pdfplumber"}:
+        show_pdfplumber = True
+        show_vision = False
 
-    pdfplumber_payload = _json_from_result(pdfplumber_result)
-    vision_payload = _json_from_result(vision_result)
+    # Run only what the caller asked for (Vision can be expensive).
+    pdfplumber_result = None
+    vision_result = None
+    if show_pdfplumber:
+        pdfplumber_result = await parse_bank_statement_from_url(
+            url=url,
+            authorization=auth,
+            includeVisionDump=False,
+            useVision=False,
+        )
+    if show_vision:
+        vision_result = await parse_bank_statement_from_url(
+            url=url,
+            authorization=auth,
+            includeVisionDump=True,
+            useVision=True,
+            visionMaxPages=effective_vision_max_pages,
+            visionDpi=visionDpi,
+        )
+
+    pdfplumber_payload = _json_from_result(pdfplumber_result) if pdfplumber_result is not None else {"ok": True, "transactions": [], "steps": [], "notes": []}
+    vision_payload = _json_from_result(vision_result) if vision_result is not None else {"ok": True, "transactions": [], "steps": [], "notes": []}
 
     pdfplumber_tx = pdfplumber_payload.get("transactions", []) if isinstance(pdfplumber_payload, dict) else []
     vision_tx = vision_payload.get("transactions", []) if isinstance(vision_payload, dict) else []
@@ -1593,6 +1608,48 @@ async def parse_bank_statement_quick_view(
         f"&visionMaxPages={int(effective_vision_max_pages)}&visionDpi={int(visionDpi)}"
     )
 
+    tabs_html = ""
+    if show_pdfplumber and show_vision:
+        tabs_html = """
+<div class="tabs">
+  <button class="tabbtn active" data-tab="pdfplumber">pdfplumber</button>
+  <button class="tabbtn" data-tab="vision">google vision</button>
+</div>
+"""
+
+    top_links = ""
+    if show_vision:
+        top_links = f'Vision dump download: <a href="{vision_dump_download_url}">/parse-bank-statement/vision-dump</a>'
+
+    # Default active panel depends on "only".
+    pdf_active = "active" if (show_pdfplumber and (not show_vision or (show_pdfplumber and show_vision))) else ""
+    vision_active = "active" if (show_vision and not show_pdfplumber) else ""
+
+    pdf_section_html = ""
+    if show_pdfplumber:
+        pdf_section_html = f"""
+<div id="pdfplumber" class="panel {pdf_active}">
+  <h4>pdfplumber-first parse</h4>
+  <p class="muted">Rows shown: {len(pdfplumber_tx)}</p>
+  {_render_table(pdfplumber_tx)}
+  <h4>Statement CSV</h4><pre>{pdfplumber_csv.replace('<','&lt;')}</pre>
+  <h4>Steps / Notes</h4><pre>{pdfplumber_meta}</pre>
+</div>
+"""
+
+    vision_section_html = ""
+    if show_vision:
+        vision_section_html = f"""
+<div id="vision" class="panel {vision_active}">
+  <h4>Google Vision parse (visionMaxPages={int(effective_vision_max_pages)} dpi={int(visionDpi)})</h4>
+  <p class="muted">Rows shown: {len(vision_tx)}</p>
+  {_render_table(vision_tx)}
+  <h4>Google Vision Dump (preview)</h4><pre>{vision_dump_preview.replace('<','&lt;')}</pre>
+  <h4>Statement CSV</h4><pre>{vision_csv.replace('<','&lt;')}</pre>
+  <h4>Steps / Notes</h4><pre>{vision_meta}</pre>
+</div>
+"""
+
     return f"""<!doctype html>
 <html><head><meta charset="utf-8"/><title>TaxPig Quick View</title>
 <style>
@@ -1611,40 +1668,24 @@ async def parse_bank_statement_quick_view(
 </head><body>
 <h3>Quick View: {url}</h3>
 <div class="muted">
-  Tabs: pdfplumber-first vs Google Vision. Vision dump download:
-  <a href="{vision_dump_download_url}">/parse-bank-statement/vision-dump</a>
+  {top_links}
 </div>
-<div class="tabs">
-  <button class="tabbtn active" data-tab="pdfplumber">pdfplumber</button>
-  <button class="tabbtn" data-tab="vision">google vision</button>
-</div>
+{tabs_html}
 
-<div id="pdfplumber" class="panel active">
-  <h4>pdfplumber-first parse</h4>
-  <p class="muted">Rows shown: {len(pdfplumber_tx)}</p>
-  {_render_table(pdfplumber_tx)}
-  <h4>Statement CSV</h4><pre>{pdfplumber_csv.replace('<','&lt;')}</pre>
-  <h4>Steps / Notes</h4><pre>{pdfplumber_meta}</pre>
-</div>
-
-<div id="vision" class="panel">
-  <h4>Google Vision parse (visionMaxPages={int(effective_vision_max_pages)} dpi={int(visionDpi)})</h4>
-  <p class="muted">Rows shown: {len(vision_tx)}</p>
-  {_render_table(vision_tx)}
-  <h4>Google Vision Dump (preview)</h4><pre>{vision_dump_preview.replace('<','&lt;')}</pre>
-  <h4>Statement CSV</h4><pre>{vision_csv.replace('<','&lt;')}</pre>
-  <h4>Steps / Notes</h4><pre>{vision_meta}</pre>
-</div>
+{pdf_section_html}
+{vision_section_html}
 
 <script>
   const btns = Array.from(document.querySelectorAll('.tabbtn'));
-  const panels = Array.from(document.querySelectorAll('.panel'));
-  for (const b of btns) {{
-    b.addEventListener('click', () => {{
-      for (const x of btns) x.classList.toggle('active', x === b);
-      const id = b.getAttribute('data-tab');
-      for (const p of panels) p.classList.toggle('active', p.id === id);
-    }});
+  if (btns.length) {{
+    const panels = Array.from(document.querySelectorAll('.panel'));
+    for (const b of btns) {{
+      b.addEventListener('click', () => {{
+        for (const x of btns) x.classList.toggle('active', x === b);
+        const id = b.getAttribute('data-tab');
+        for (const p of panels) p.classList.toggle('active', p.id === id);
+      }});
+    }}
   }}
 </script>
 </body></html>"""

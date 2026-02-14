@@ -3,6 +3,7 @@ import json
 import os
 import re
 import uuid
+import base64
 from tempfile import SpooledTemporaryFile
 from urllib.parse import unquote, urlparse
 from datetime import datetime
@@ -37,6 +38,40 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 GPT_MODEL = os.getenv("GPT_MODEL", "gpt-4o-mini")
 GPT_MAX_SAMPLE_ROWS = int(os.getenv("GPT_MAX_SAMPLE_ROWS", "20"))
 CONFIDENCE_REVIEW_THRESHOLD = float(os.getenv("CONFIDENCE_REVIEW_THRESHOLD", "0.55"))
+GOOGLE_VISION_DISABLE = os.getenv("GOOGLE_VISION_DISABLE", "").strip().lower() in {"1", "true", "yes"}
+GOOGLE_APPLICATION_CREDENTIALS_JSON = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON", "").strip()
+
+
+def _maybe_write_google_adc_from_env() -> Optional[str]:
+    """
+    Railway-friendly ADC configuration.
+    If GOOGLE_APPLICATION_CREDENTIALS_JSON is set, write it to /tmp and point
+    GOOGLE_APPLICATION_CREDENTIALS at it.
+    """
+    if not GOOGLE_APPLICATION_CREDENTIALS_JSON:
+        return None
+    if os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
+        return None
+    raw = GOOGLE_APPLICATION_CREDENTIALS_JSON
+    try:
+        if raw.lstrip().startswith("{"):
+            data = json.loads(raw)
+        else:
+            decoded = base64.b64decode(raw.encode("utf-8")).decode("utf-8")
+            data = json.loads(decoded)
+    except Exception as exc:
+        return f"google_adc_env_invalid:{exc}"
+    try:
+        path = "/tmp/google_application_credentials.json"
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = path
+        return None
+    except Exception as exc:
+        return f"google_adc_env_write_failed:{exc}"
+
+
+_GOOGLE_ADC_ENV_ERROR = _maybe_write_google_adc_from_env()
 
 DATE_REGEX = re.compile(
     r"\b(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{2,4}|[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{2,4})\b"
@@ -99,11 +134,42 @@ def build_error_response(
             "text": "",
             "textPreview": "",
             "transactions": [],
+            "statementCsv": "",
+            "googleVisionDump": None,
+            "googleVisionDumpError": None,
             "regexPlan": None,
             "steps": steps,
             "notes": notes + [message],
         },
     )
+
+
+def try_google_vision_dump(image_bytes: bytes) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """
+    Best-effort Google Vision dump for debugging. Returns the raw response as a JSON-serializable dict.
+
+    This is optional: if credentials/library are not available we return (None, <reason>).
+    """
+    if GOOGLE_VISION_DISABLE:
+        return None, "disabled"
+    if _GOOGLE_ADC_ENV_ERROR:
+        return None, _GOOGLE_ADC_ENV_ERROR
+    try:
+        from google.cloud import vision  # type: ignore
+        from google.protobuf.json_format import MessageToDict  # type: ignore
+    except Exception as exc:
+        return None, f"google_cloud_vision_import_error:{exc}"
+    try:
+        client = vision.ImageAnnotatorClient()
+        image = vision.Image(content=image_bytes)
+        resp = client.document_text_detection(image=image)
+        # If Vision returns an error payload, surface it.
+        if getattr(resp, "error", None) and getattr(resp.error, "message", ""):
+            return None, f"google_vision_error:{resp.error.message}"
+        dump = MessageToDict(resp._pb)  # raw proto -> dict
+        return dump, None
+    except Exception as exc:
+        return None, f"google_vision_call_error:{exc}"
 
 
 def parse_date(value: str) -> Optional[str]:
@@ -1224,6 +1290,7 @@ def _transactions_to_statement_csv(transactions: List[Dict[str, Any]]) -> str:
 async def parse_bank_statement_from_url(
     url: str,
     authorization: Optional[str] = Header(default=None),
+    includeVisionDump: bool = False,
 ):
     steps: List[Dict[str, str]] = []
     notes: List[str] = []
@@ -1254,7 +1321,7 @@ async def parse_bank_statement_from_url(
         tmp.seek(0)
         headers = Headers({"content-type": guessed_type or "application/octet-stream"})
         uf = StarletteUploadFile(file=tmp, filename=guessed_name, headers=headers)
-        result = await parse_bank_statement(file=uf, authorization=authorization)
+        result = await parse_bank_statement(file=uf, authorization=authorization, includeVisionDump=includeVisionDump)
         payload = _json_from_result(result)
         if isinstance(payload, dict) and "transactions" in payload:
             payload["statementCsv"] = _transactions_to_statement_csv(list(payload.get("transactions") or []))
@@ -1270,7 +1337,7 @@ async def parse_bank_statement_from_url(
 @app.get("/parse-bank-statement/quick-view", response_class=HTMLResponse)
 async def parse_bank_statement_quick_view(url: str, token: Optional[str] = None) -> str:
     auth = f"Bearer {token}" if token else None
-    result = await parse_bank_statement_from_url(url=url, authorization=auth)
+    result = await parse_bank_statement_from_url(url=url, authorization=auth, includeVisionDump=True)
     payload = _json_from_result(result)
     tx = payload.get("transactions", []) if isinstance(payload, dict) else []
     rows = []
@@ -1293,6 +1360,16 @@ async def parse_bank_statement_quick_view(url: str, token: Optional[str] = None)
         )
     meta = json.dumps({"ok": payload.get("ok"), "steps": payload.get("steps", []), "notes": payload.get("notes", [])}, indent=2)
     csv_text = str(payload.get("statementCsv") or "")
+    vision_dump = payload.get("googleVisionDump")
+    vision_err = payload.get("googleVisionDumpError")
+    vision_text = ""
+    if vision_dump is not None:
+        try:
+            vision_text = json.dumps(vision_dump, indent=2)
+        except Exception:
+            vision_text = str(vision_dump)
+    elif vision_err:
+        vision_text = f"(not available: {vision_err})"
     return f"""<!doctype html>
 <html><head><meta charset="utf-8"/><title>TaxPig Quick View</title>
 <style>body{{font-family:Arial;margin:18px}}table{{border-collapse:collapse;width:100%}}th,td{{border:1px solid #ddd;padding:6px;font-size:12px}}th{{background:#f3f3f3}}pre{{background:#111;color:#eee;padding:8px}}</style>
@@ -1301,6 +1378,7 @@ async def parse_bank_statement_quick_view(url: str, token: Optional[str] = None)
 <p>Rows shown: {len(tx)}</p>
 <table><thead><tr><th>Date</th><th>Payment Type</th><th>Paid out</th><th>Paid in</th><th>Balance</th><th>Type</th><th>Amount</th><th>Payee/Payer</th><th>Transaction Description</th><th>Original Source Text</th><th>Reference</th><th>Confidence</th></tr></thead>
 <tbody>{''.join(rows) if rows else '<tr><td colspan="12">No transactions</td></tr>'}</tbody></table>
+<h4>Google Vision Dump</h4><pre>{vision_text.replace('<','&lt;')}</pre>
 <h4>Statement CSV</h4><pre>{csv_text.replace('<','&lt;')}</pre>
 <h4>Steps / Notes</h4><pre>{meta}</pre>
 </body></html>"""
@@ -1310,6 +1388,7 @@ async def parse_bank_statement_quick_view(url: str, token: Optional[str] = None)
 async def parse_bank_statement(
     file: UploadFile = File(...),
     authorization: Optional[str] = Header(default=None),
+    includeVisionDump: bool = False,
 ):
     steps: List[Dict[str, str]] = []
     notes: List[str] = []
@@ -1348,6 +1427,8 @@ async def parse_bank_statement(
 
         raw_rows: List[Dict[str, Any]] = []
         ocr_pages: List[str] = []
+        google_vision_dump: Optional[Dict[str, Any]] = None
+        google_vision_err: Optional[str] = None
         if ext == ".pdf":
             pages = extract_pdfplumber_pages(pdf_bytes)
             add_step(steps, "pdfplumber", "success", f"Extracted {len(pages)} pages.")
@@ -1380,6 +1461,9 @@ async def parse_bank_statement(
                         notes.append(f"OCR skipped/failed for page {page_number}: {ocr_detail}")
                         add_step(steps, "ocr_page_if_needed", "failed", ocr_detail)
         else:
+            # Debug-only: capture raw Google Vision response (if configured) for this image upload.
+            if includeVisionDump:
+                google_vision_dump, google_vision_err = try_google_vision_dump(pdf_bytes)
             ocr_rows, ocr_detail = ocr_image_file(pdf_bytes)
             if ocr_rows:
                 raw_rows.extend(ocr_rows)
@@ -1452,6 +1536,8 @@ async def parse_bank_statement(
             "textPreview": full_text[:2000] if full_text else "",
             "transactions": tx_dump,
             "statementCsv": _transactions_to_statement_csv(tx_dump),
+            "googleVisionDump": google_vision_dump,
+            "googleVisionDumpError": google_vision_err,
             "regexPlan": regex_plan.model_dump(),
             "steps": [Step(**s).model_dump() for s in steps],
             "notes": notes,

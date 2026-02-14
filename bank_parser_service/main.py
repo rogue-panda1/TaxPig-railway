@@ -46,6 +46,11 @@ AMOUNT_REGEX = re.compile(
 )
 ROW_REGEX = r"(?P<date>\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{2,4}).*?(?P<amount>[-(]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{2})\)?)"
 
+PAYMENT_TYPE_REGEX = re.compile(
+    r"\b(DD|VIS|BP|BGC|FPO|SO|CHQ|ATM|POS|CASH)\b",
+    flags=re.I,
+)
+
 
 class Step(BaseModel):
     service: str
@@ -61,6 +66,10 @@ class Transaction(BaseModel):
     description: str
     transactionDescription: Optional[str] = None
     originalSourceText: Optional[str] = None
+    paymentType: Optional[str] = None
+    paidOutGbp: Optional[float] = None
+    paidInGbp: Optional[float] = None
+    balanceGbp: Optional[float] = None
     reference: str
     amount: float
     category: str = "Bank statement import"
@@ -221,6 +230,175 @@ def _group_words_into_lines(words: List[Dict[str, Any]], y_tol: float = 3.0) -> 
         else:
             lines.append([word])
     return lines
+
+
+def _is_amount_token(text: str) -> bool:
+    s = (text or "").strip()
+    if not s:
+        return False
+    if not re.search(r"\d", s):
+        return False
+    # Amount tokens should include decimals in bank tables; avoid capturing years / account numbers.
+    return bool(re.fullmatch(r"(?:£|\$|€)?\s*[-(]?(?:\d{1,3}(?:,\d{3})+|\d+)\.\d{2}\)?", s))
+
+
+def _infer_amount_column_centers(words: List[Dict[str, Any]], page_width: float) -> Tuple[float, float, float]:
+    xs: List[float] = []
+    for w in words:
+        if _is_amount_token(str(w.get("text", ""))):
+            x0 = float(w.get("x0", 0))
+            x1 = float(w.get("x1", 0))
+            xs.append((x0 + x1) / 2.0)
+    if len(xs) < 8:
+        return (page_width * 0.68, page_width * 0.82, page_width * 0.93)
+    # Histogram peaks (simple, robust).
+    bins = 30
+    mn, mx = min(xs), max(xs)
+    if mx - mn < 1:
+        return (page_width * 0.68, page_width * 0.82, page_width * 0.93)
+    counts = [0] * bins
+    for x in xs:
+        idx = int((x - mn) / (mx - mn) * (bins - 1))
+        counts[idx] += 1
+    # Pick top 3 bins with separation.
+    picked = []
+    for idx in sorted(range(bins), key=lambda i: counts[i], reverse=True):
+        if counts[idx] == 0:
+            break
+        if all(abs(idx - p) >= 3 for p in picked):
+            picked.append(idx)
+        if len(picked) == 3:
+            break
+    if len(picked) < 3:
+        return (page_width * 0.68, page_width * 0.82, page_width * 0.93)
+    centers = sorted(mn + (p + 0.5) * (mx - mn) / bins for p in picked)
+    # left=paid_out, middle=paid_in, right=balance
+    return (centers[0], centers[1], centers[2])
+
+
+def reconstruct_rows_statement_columns(page_data: Dict[str, Any], source: str) -> List[Dict[str, Any]]:
+    """
+    OCR/table-style parsing:
+    - date shown once, subsequent rows inherit date
+    - payment type (DD/VIS/BP/...) column
+    - paid out / paid in / balance numeric columns on the right
+    """
+    rows: List[Dict[str, Any]] = []
+    page_number = int(page_data.get("pageNumber", 1))
+    width = float(page_data.get("width", 0))
+    words = page_data.get("words", []) or []
+
+    out_x, in_x, bal_x = _infer_amount_column_centers(words, width)
+
+    lines = _group_words_into_lines(words, y_tol=4.0)
+    current_date = ""
+    current_row: Optional[Dict[str, Any]] = None
+
+    def flush():
+        nonlocal current_row
+        if current_row:
+            rows.append(current_row)
+            current_row = None
+
+    for line in lines:
+        line_sorted = sorted(line, key=lambda w: float(w.get("x0", 0)))
+        text = _line_text(line_sorted)
+        if not text:
+            continue
+
+        # Ignore obvious header area.
+        if _is_probable_header(text) or "account details" in text.lower():
+            continue
+
+        date_match = DATE_REGEX.search(text)
+        if date_match:
+            current_date = date_match.group(1)
+
+        pt_match = PAYMENT_TYPE_REGEX.search(text)
+        payment_type = (pt_match.group(1).upper() if pt_match else "").strip()
+        # Common OCR artifact for contactless in this statement.
+        if not payment_type and ")))" in text:
+            payment_type = "CONTACTLESS"
+
+        # Amount tokens w/ columns by x-position.
+        paid_out_raw = ""
+        paid_in_raw = ""
+        balance_raw = ""
+        for w in line_sorted:
+            wt = str(w.get("text", "")).strip()
+            if not _is_amount_token(wt):
+                continue
+            cx = (float(w.get("x0", 0)) + float(w.get("x1", 0))) / 2.0
+            # nearest column
+            nearest = min(
+                [("out", out_x), ("in", in_x), ("bal", bal_x)],
+                key=lambda kv: abs(cx - kv[1]),
+            )[0]
+            if nearest == "out":
+                paid_out_raw = wt
+            elif nearest == "in":
+                paid_in_raw = wt
+            else:
+                balance_raw = wt
+
+        # Balance lines
+        if "balance brought forward" in text.lower() or "balance carried forward" in text.lower():
+            flush()
+            desc = "Balance brought forward" if "brought" in text.lower() else "Balance carried forward"
+            rows.append(
+                {
+                    "source": source,
+                    "pageNumber": page_number,
+                    "dateRaw": current_date or (date_match.group(1) if date_match else ""),
+                    "paymentType": "BALANCE",
+                    "descriptionRaw": desc,
+                    "paidOutRaw": "",
+                    "paidInRaw": "",
+                    "balanceRaw": balance_raw or (AMOUNT_REGEX.findall(text)[-1] if AMOUNT_REGEX.findall(text) else ""),
+                }
+            )
+            continue
+
+        # Start a new transaction row when payment type exists OR we have an amount and a date.
+        is_row_start = bool(payment_type) or (bool(date_match) and (paid_out_raw or paid_in_raw))
+        if is_row_start:
+            flush()
+            # Extract details text: strip date + payment type + numeric tokens.
+            details = text
+            if current_date:
+                details = re.sub(re.escape(current_date), " ", details, count=1)
+            if payment_type:
+                details = re.sub(rf"\\b{re.escape(payment_type)}\\b", " ", details, count=1, flags=re.I)
+            details = re.sub(r"\\b\\d{1,3}(?:,\\d{3})*\\.\\d{2}\\b", " ", details)
+            details = _strip_noise_tokens(details)
+            if not details and payment_type:
+                details = payment_type
+            current_row = {
+                "source": source,
+                "pageNumber": page_number,
+                "dateRaw": current_date,
+                "paymentType": payment_type,
+                "descriptionRaw": details,
+                "paidOutRaw": paid_out_raw,
+                "paidInRaw": paid_in_raw,
+                "balanceRaw": balance_raw,
+            }
+            continue
+
+        # Continuation line (details wraps).
+        if current_row:
+            cont = text
+            if current_date:
+                cont = re.sub(re.escape(current_date), " ", cont, count=1)
+            cont = re.sub(r"\\b\\d{1,3}(?:,\\d{3})*\\.\\d{2}\\b", " ", cont)
+            cont = _strip_noise_tokens(cont)
+            if cont:
+                current_row["descriptionRaw"] = " ".join(
+                    f"{current_row.get('descriptionRaw','')} {cont}".split()
+                )
+
+    flush()
+    return rows
 
 
 def _line_text(line_words: List[Dict[str, Any]]) -> str:
@@ -470,8 +648,12 @@ def ocr_page_if_needed(pdf_bytes: bytes, page_number: int, reasons: List[str]) -
             "tables": [],
             "text": " ".join(w["text"] for w in words),
         }
+        # Prefer statement-column reconstruction for OCR output; it handles repeated-date blocks.
+        parsed = reconstruct_rows_statement_columns(page_data, source="ocr")
+        if parsed:
+            return parsed, f"ocr_applied:page={page_number},words={extracted_words},mode=columns,reasons={','.join(reasons)}"
         return reconstruct_rows_geometric(page_data, source="ocr"), (
-            f"ocr_applied:page={page_number},words={extracted_words},reasons={','.join(reasons)}"
+            f"ocr_applied:page={page_number},words={extracted_words},mode=generic,reasons={','.join(reasons)}"
         )
     except Exception as exc:
         return [], f"ocr_failed:{exc}"
@@ -510,7 +692,10 @@ def ocr_image_file(image_bytes: bytes) -> Tuple[List[Dict[str, Any]], str]:
             "tables": [],
             "text": " ".join(w["text"] for w in words),
         }
-        return reconstruct_rows_geometric(page_data, source="ocr_image"), f"ocr_image_words={extracted_words}"
+        parsed = reconstruct_rows_statement_columns(page_data, source="ocr_image")
+        if parsed:
+            return parsed, f"ocr_image_words={extracted_words},mode=columns"
+        return reconstruct_rows_geometric(page_data, source="ocr_image"), f"ocr_image_words={extracted_words},mode=generic"
     except Exception as exc:
         return [], f"ocr_image_failed:{exc}"
 
@@ -725,12 +910,26 @@ def normalize_transactions(raw_rows: List[Dict[str, Any]]) -> Tuple[List[Dict[st
     failed: List[Dict[str, Any]] = []
     for row in raw_rows:
         date_value = parse_date(str(row.get("dateRaw", "")).strip())
-        amount_value = parse_amount(str(row.get("amountRaw", "")).strip())
-        original_source_text = " ".join(str(row.get("descriptionRaw", "")).split())
+
+        payment_type = str(row.get("paymentType") or "").strip() or None
+        paid_out = parse_amount(str(row.get("paidOutRaw", "")).strip()) if row.get("paidOutRaw") else None
+        paid_in = parse_amount(str(row.get("paidInRaw", "")).strip()) if row.get("paidInRaw") else None
+        balance = parse_amount(str(row.get("balanceRaw", "")).strip()) if row.get("balanceRaw") else None
+
+        # Primary amount used for income/expense classification.
+        amount_value = None
+        if paid_out is not None and paid_out != 0:
+            amount_value = -abs(paid_out)
+        elif paid_in is not None and paid_in != 0:
+            amount_value = abs(paid_in)
+        else:
+            amount_value = parse_amount(str(row.get("amountRaw", "")).strip())
+
+        original_source_text = " ".join(str(row.get("originalSourceText") or row.get("descriptionRaw", "")).split())
         description = _derive_transaction_description(
             original_source_text,
             str(row.get("dateRaw", "")).strip(),
-            str(row.get("amountRaw", "")).strip(),
+            str(row.get("amountRaw", "")).strip() or str(row.get("paidOutRaw", "")).strip() or str(row.get("paidInRaw", "")).strip(),
         )
         if _is_summary_non_transaction_line(description):
             failed.append({**row, "_reason": "summary_line"})
@@ -760,6 +959,10 @@ def normalize_transactions(raw_rows: List[Dict[str, Any]]) -> Tuple[List[Dict[st
             "description": description,
             "transactionDescription": description,
             "originalSourceText": original_source_text,
+            "paymentType": payment_type,
+            "paidOutGbp": abs(paid_out) if paid_out is not None else None,
+            "paidInGbp": abs(paid_in) if paid_in is not None else None,
+            "balanceGbp": balance,
             "reference": reference,
             "amount": abs(round(float(amount_value), 2)),
             "category": "Bank statement import",

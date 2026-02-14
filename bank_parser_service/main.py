@@ -40,7 +40,9 @@ GPT_MAX_SAMPLE_ROWS = int(os.getenv("GPT_MAX_SAMPLE_ROWS", "20"))
 CONFIDENCE_REVIEW_THRESHOLD = float(os.getenv("CONFIDENCE_REVIEW_THRESHOLD", "0.55"))
 GOOGLE_VISION_DISABLE = os.getenv("GOOGLE_VISION_DISABLE", "").strip().lower() in {"1", "true", "yes"}
 GOOGLE_APPLICATION_CREDENTIALS_JSON = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON", "").strip()
-GOOGLE_VISION_DEFAULT_MAX_PAGES = int(os.getenv("GOOGLE_VISION_DEFAULT_MAX_PAGES", "1"))
+# Default to "all pages" (0 = no limit) for statements.
+# You can override per-request with visionMaxPages=...
+GOOGLE_VISION_DEFAULT_MAX_PAGES = int(os.getenv("GOOGLE_VISION_DEFAULT_MAX_PAGES", "0"))
 GOOGLE_VISION_DEFAULT_DPI = int(os.getenv("GOOGLE_VISION_DEFAULT_DPI", "200"))
 
 
@@ -198,12 +200,21 @@ def try_google_vision_dump_pages_from_pdf(
     except Exception as exc:
         return [], f"pdf2image_import_error:{exc}"
     try:
-        images = convert_from_bytes(pdf_bytes, dpi=dpi, fmt="png")
+        # Important: don't render the whole PDF if we're only OCR'ing the first N pages.
+        # pdf2image is 1-indexed for first_page/last_page.
+        if int(max_pages) <= 0:
+            images = convert_from_bytes(pdf_bytes, dpi=dpi, fmt="png")
+        else:
+            images = convert_from_bytes(
+                pdf_bytes, dpi=dpi, fmt="png", first_page=1, last_page=max(1, int(max_pages))
+            )
         if not images:
             return [], "pdf_render_failed_no_pages"
         client = vision.ImageAnnotatorClient()
         out: List[Dict[str, Any]] = []
-        for idx, img in enumerate(images[: max(1, int(max_pages))], start=1):
+        # If max_pages<=0 we treat it as "all pages rendered".
+        page_limit = len(images) if int(max_pages) <= 0 else max(1, int(max_pages))
+        for idx, img in enumerate(images[:page_limit], start=1):
             buf = io.BytesIO()
             img.save(buf, format="PNG")
             resp = client.document_text_detection(image=vision.Image(content=buf.getvalue()))
@@ -1429,7 +1440,7 @@ async def parse_bank_statement_from_url(
     authorization: Optional[str] = Header(default=None),
     includeVisionDump: bool = False,
     useVision: bool = False,
-    visionMaxPages: int = 1,
+    visionMaxPages: Optional[int] = None,
     visionDpi: int = GOOGLE_VISION_DEFAULT_DPI,
 ):
     steps: List[Dict[str, str]] = []
@@ -1474,7 +1485,7 @@ async def parse_bank_statement_from_url(
             authorization=authorization,
             includeVisionDump=includeVisionDump,
             useVision=useVision,
-            visionMaxPages=visionMaxPages,
+            visionMaxPages=GOOGLE_VISION_DEFAULT_MAX_PAGES if visionMaxPages is None else int(visionMaxPages),
             visionDpi=visionDpi,
         )
         payload = _json_from_result(result)
@@ -1493,10 +1504,11 @@ async def parse_bank_statement_from_url(
 async def parse_bank_statement_quick_view(
     url: str,
     token: Optional[str] = None,
-    visionMaxPages: int = GOOGLE_VISION_DEFAULT_MAX_PAGES,
+    visionMaxPages: Optional[int] = None,
     visionDpi: int = GOOGLE_VISION_DEFAULT_DPI,
 ) -> str:
     auth = f"Bearer {token}" if token else None
+    effective_vision_max_pages = GOOGLE_VISION_DEFAULT_MAX_PAGES if visionMaxPages is None else int(visionMaxPages)
 
     def _render_table(transactions: List[Dict[str, Any]]) -> str:
         rows = []
@@ -1539,7 +1551,7 @@ async def parse_bank_statement_quick_view(
         authorization=auth,
         includeVisionDump=True,
         useVision=True,
-        visionMaxPages=visionMaxPages,
+        visionMaxPages=effective_vision_max_pages,
         visionDpi=visionDpi,
     )
 
@@ -1578,7 +1590,7 @@ async def parse_bank_statement_quick_view(
     token_q = f"&token={token}" if token else ""
     vision_dump_download_url = (
         f"/parse-bank-statement/vision-dump?url={requests.utils.quote(url, safe='')}{token_q}"
-        f"&visionMaxPages={int(visionMaxPages)}&visionDpi={int(visionDpi)}"
+        f"&visionMaxPages={int(effective_vision_max_pages)}&visionDpi={int(visionDpi)}"
     )
 
     return f"""<!doctype html>
@@ -1616,7 +1628,7 @@ async def parse_bank_statement_quick_view(
 </div>
 
 <div id="vision" class="panel">
-  <h4>Google Vision parse (visionMaxPages={int(visionMaxPages)} dpi={int(visionDpi)})</h4>
+  <h4>Google Vision parse (visionMaxPages={int(effective_vision_max_pages)} dpi={int(visionDpi)})</h4>
   <p class="muted">Rows shown: {len(vision_tx)}</p>
   {_render_table(vision_tx)}
   <h4>Google Vision Dump (preview)</h4><pre>{vision_dump_preview.replace('<','&lt;')}</pre>
@@ -1643,7 +1655,7 @@ async def parse_bank_statement_vision_dump(
     url: str,
     token: Optional[str] = None,
     authorization: Optional[str] = Header(default=None),
-    visionMaxPages: int = GOOGLE_VISION_DEFAULT_MAX_PAGES,
+    visionMaxPages: Optional[int] = None,
     visionDpi: int = GOOGLE_VISION_DEFAULT_DPI,
 ):
     """
@@ -1655,7 +1667,7 @@ async def parse_bank_statement_vision_dump(
         authorization=auth,
         includeVisionDump=True,
         useVision=True,
-        visionMaxPages=visionMaxPages,
+        visionMaxPages=GOOGLE_VISION_DEFAULT_MAX_PAGES if visionMaxPages is None else int(visionMaxPages),
         visionDpi=visionDpi,
     )
     payload = _json_from_result(result)
@@ -1672,7 +1684,7 @@ async def parse_bank_statement(
     authorization: Optional[str] = Header(default=None),
     includeVisionDump: bool = False,
     useVision: bool = False,
-    visionMaxPages: int = GOOGLE_VISION_DEFAULT_MAX_PAGES,
+    visionMaxPages: Optional[int] = None,
     visionDpi: int = GOOGLE_VISION_DEFAULT_DPI,
 ):
     steps: List[Dict[str, str]] = []
@@ -1718,7 +1730,7 @@ async def parse_bank_statement(
             if useVision:
                 vision_rows, google_vision_dump, google_vision_err = _parse_pdf_with_google_vision(
                     pdf_bytes,
-                    max_pages=int(visionMaxPages),
+                    max_pages=GOOGLE_VISION_DEFAULT_MAX_PAGES if visionMaxPages is None else int(visionMaxPages),
                     dpi=int(visionDpi),
                     steps=steps,
                     include_dump=includeVisionDump,

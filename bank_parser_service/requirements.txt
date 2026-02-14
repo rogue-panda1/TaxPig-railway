@@ -8,4 +8,5 @@ pytesseract
 Pillow
 openai
 requests
+certifi
 google-cloud-vision

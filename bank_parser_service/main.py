@@ -40,6 +40,8 @@ GPT_MAX_SAMPLE_ROWS = int(os.getenv("GPT_MAX_SAMPLE_ROWS", "20"))
 CONFIDENCE_REVIEW_THRESHOLD = float(os.getenv("CONFIDENCE_REVIEW_THRESHOLD", "0.55"))
 GOOGLE_VISION_DISABLE = os.getenv("GOOGLE_VISION_DISABLE", "").strip().lower() in {"1", "true", "yes"}
 GOOGLE_APPLICATION_CREDENTIALS_JSON = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON", "").strip()
+GOOGLE_VISION_DEFAULT_MAX_PAGES = int(os.getenv("GOOGLE_VISION_DEFAULT_MAX_PAGES", "1"))
+GOOGLE_VISION_DEFAULT_DPI = int(os.getenv("GOOGLE_VISION_DEFAULT_DPI", "200"))
 
 
 def _maybe_write_google_adc_from_env() -> Optional[str]:
@@ -81,8 +83,9 @@ AMOUNT_REGEX = re.compile(
 )
 ROW_REGEX = r"(?P<date>\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{2,4}).*?(?P<amount>[-(]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{2})\)?)"
 
+# Bank statement "type" codes vary by bank. Keep this broad.
 PAYMENT_TYPE_REGEX = re.compile(
-    r"\b(DD|VIS|BP|BGC|FPO|SO|CHQ|ATM|POS|CASH)\b",
+    r"\b(DD|VIS|BP|BGC|FPO|FPI|TFR|SO|CHQ|ATM|POS|CASH|DEB|DEP|CPT|FEE|PAY|MPI|MPO)\b",
     flags=re.I,
 )
 
@@ -170,6 +173,140 @@ def try_google_vision_dump(image_bytes: bytes) -> Tuple[Optional[Dict[str, Any]]
         return dump, None
     except Exception as exc:
         return None, f"google_vision_call_error:{exc}"
+
+
+def try_google_vision_dump_pages_from_pdf(
+    pdf_bytes: bytes, max_pages: int, dpi: int
+) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    """
+    Render PDF pages to images and run Google Vision Document OCR per page.
+
+    Returns: (pages, error)
+      pages[] = {"pageNumber", "width", "height", "dump"}
+    """
+    if GOOGLE_VISION_DISABLE:
+        return [], "disabled"
+    if _GOOGLE_ADC_ENV_ERROR:
+        return [], _GOOGLE_ADC_ENV_ERROR
+    try:
+        from google.cloud import vision  # type: ignore
+        from google.protobuf.json_format import MessageToDict  # type: ignore
+    except Exception as exc:
+        return [], f"google_cloud_vision_import_error:{exc}"
+    try:
+        from pdf2image import convert_from_bytes
+    except Exception as exc:
+        return [], f"pdf2image_import_error:{exc}"
+    try:
+        images = convert_from_bytes(pdf_bytes, dpi=dpi, fmt="png")
+        if not images:
+            return [], "pdf_render_failed_no_pages"
+        client = vision.ImageAnnotatorClient()
+        out: List[Dict[str, Any]] = []
+        for idx, img in enumerate(images[: max(1, int(max_pages))], start=1):
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            resp = client.document_text_detection(image=vision.Image(content=buf.getvalue()))
+            if getattr(resp, "error", None) and getattr(resp.error, "message", ""):
+                return out, f"google_vision_error:{resp.error.message}"
+            out.append(
+                {
+                    "pageNumber": idx,
+                    "width": int(getattr(img, "width", 0) or 0),
+                    "height": int(getattr(img, "height", 0) or 0),
+                    "dump": MessageToDict(resp._pb),
+                }
+            )
+        return out, None
+    except Exception as exc:
+        return [], f"google_vision_call_error:{exc}"
+
+
+def _vision_dump_page_to_words(vision_dump: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Convert Vision fullTextAnnotation->words into the same word shape used by our OCR pipeline.
+    """
+    words: List[Dict[str, Any]] = []
+    fta = (vision_dump or {}).get("fullTextAnnotation") or {}
+    pages = fta.get("pages") or []
+    for p in pages:
+        for block in p.get("blocks") or []:
+            for para in block.get("paragraphs") or []:
+                for w in para.get("words") or []:
+                    syms = w.get("symbols") or []
+                    text = "".join((s.get("text") or "") for s in syms).strip()
+                    if not text:
+                        continue
+                    verts = (w.get("boundingBox") or {}).get("vertices") or []
+                    xs = [int(v.get("x", 0) or 0) for v in verts] or [0]
+                    ys = [int(v.get("y", 0) or 0) for v in verts] or [0]
+                    x0, x1 = min(xs), max(xs)
+                    y0, y1 = min(ys), max(ys)
+                    words.append(
+                        {
+                            "text": text,
+                            "x0": float(x0),
+                            "x1": float(x1),
+                            "top": float(y0),
+                            "bottom": float(y1),
+                        }
+                    )
+    return words
+
+
+def _vision_dump_to_page_text(vision_dump: Dict[str, Any]) -> str:
+    try:
+        fta = (vision_dump or {}).get("fullTextAnnotation") or {}
+        txt = fta.get("text") or ""
+        return str(txt)
+    except Exception:
+        return ""
+
+
+def _parse_pdf_with_google_vision(
+    pdf_bytes: bytes,
+    *,
+    max_pages: int,
+    dpi: int,
+    steps: List[Dict[str, str]],
+    include_dump: bool,
+) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]], Optional[str]]:
+    """
+    Vision-first parsing path:
+    - Render PDF pages -> PNG (pdf2image)
+    - Run Vision Document OCR per page
+    - Convert Vision words -> our page_data and reuse our row reconstruction
+    """
+    pages, err = try_google_vision_dump_pages_from_pdf(pdf_bytes, max_pages=max_pages, dpi=dpi)
+    if err:
+        add_step(steps, "google_vision", "failed", err)
+        return [], None, err
+    add_step(steps, "google_vision", "success", f"pages={len(pages)} dpi={dpi}")
+
+    raw_rows: List[Dict[str, Any]] = []
+    for p in pages:
+        page_number = int(p.get("pageNumber") or 0) or 1
+        dump = p.get("dump") or {}
+        page_data = {
+            "pageNumber": page_number,
+            "width": float(p.get("width") or 0),
+            "height": float(p.get("height") or 0),
+            "words": _vision_dump_page_to_words(dump),
+            "tables": [],
+            "text": _vision_dump_to_page_text(dump),
+        }
+
+        # Vision output is OCR-like; the statement-column parser is more robust than generic geometry alone.
+        page_rows = reconstruct_rows_statement_columns(page_data, source="google_vision")
+        if not page_rows:
+            page_rows = reconstruct_rows_geometric(page_data, source="google_vision")
+        raw_rows.extend(page_rows)
+        add_step(steps, "google_vision_page_parse", "success", f"page={page_number} rows={len(page_rows)}")
+
+    dump_out: Optional[Dict[str, Any]] = None
+    if include_dump:
+        dump_out = {"dpi": dpi, "pages": pages}
+    return raw_rows, dump_out, None
 
 
 def parse_date(value: str) -> Optional[str]:
@@ -1291,6 +1428,9 @@ async def parse_bank_statement_from_url(
     url: str,
     authorization: Optional[str] = Header(default=None),
     includeVisionDump: bool = False,
+    useVision: bool = False,
+    visionMaxPages: int = 1,
+    visionDpi: int = GOOGLE_VISION_DEFAULT_DPI,
 ):
     steps: List[Dict[str, str]] = []
     notes: List[str] = []
@@ -1299,7 +1439,15 @@ async def parse_bank_statement_from_url(
             add_step(steps, "download", "failed", "URL must start with http:// or https://")
             return build_error_response("Invalid URL.", steps, notes, status_code=400)
 
-        resp = requests.get(url, timeout=90)
+        # Some Railway base images lack a system CA bundle; force Requests to use certifi.
+        try:
+            import certifi  # type: ignore
+
+            ca_path = certifi.where()
+        except Exception:
+            ca_path = True  # fall back to requests default
+
+        resp = requests.get(url, timeout=90, verify=ca_path)
         if resp.status_code >= 400:
             add_step(steps, "download", "failed", f"HTTP {resp.status_code}")
             return build_error_response(f"Failed to download URL (HTTP {resp.status_code}).", steps, notes, 400)
@@ -1321,7 +1469,14 @@ async def parse_bank_statement_from_url(
         tmp.seek(0)
         headers = Headers({"content-type": guessed_type or "application/octet-stream"})
         uf = StarletteUploadFile(file=tmp, filename=guessed_name, headers=headers)
-        result = await parse_bank_statement(file=uf, authorization=authorization, includeVisionDump=includeVisionDump)
+        result = await parse_bank_statement(
+            file=uf,
+            authorization=authorization,
+            includeVisionDump=includeVisionDump,
+            useVision=useVision,
+            visionMaxPages=visionMaxPages,
+            visionDpi=visionDpi,
+        )
         payload = _json_from_result(result)
         if isinstance(payload, dict) and "transactions" in payload:
             payload["statementCsv"] = _transactions_to_statement_csv(list(payload.get("transactions") or []))
@@ -1335,53 +1490,180 @@ async def parse_bank_statement_from_url(
 
 
 @app.get("/parse-bank-statement/quick-view", response_class=HTMLResponse)
-async def parse_bank_statement_quick_view(url: str, token: Optional[str] = None) -> str:
+async def parse_bank_statement_quick_view(
+    url: str,
+    token: Optional[str] = None,
+    visionMaxPages: int = GOOGLE_VISION_DEFAULT_MAX_PAGES,
+    visionDpi: int = GOOGLE_VISION_DEFAULT_DPI,
+) -> str:
     auth = f"Bearer {token}" if token else None
-    result = await parse_bank_statement_from_url(url=url, authorization=auth, includeVisionDump=True)
-    payload = _json_from_result(result)
-    tx = payload.get("transactions", []) if isinstance(payload, dict) else []
-    rows = []
-    for t in tx[:1000]:
-        rows.append(
-            "<tr>"
-            f"<td>{t.get('date','')}</td>"
-            f"<td>{t.get('paymentType','')}</td>"
-            f"<td>{t.get('paidOutGbp','')}</td>"
-            f"<td>{t.get('paidInGbp','')}</td>"
-            f"<td>{t.get('balanceGbp','')}</td>"
-            f"<td>{t.get('type','')}</td>"
-            f"<td>{t.get('amount','')}</td>"
-            f"<td>{str(t.get('payeePayer','')).replace('<','&lt;')}</td>"
-            f"<td>{str(t.get('transactionDescription') or t.get('description','')).replace('<','&lt;')}</td>"
-            f"<td>{str(t.get('originalSourceText','')).replace('<','&lt;')}</td>"
-            f"<td>{str(t.get('reference','')).replace('<','&lt;')}</td>"
-            f"<td>{t.get('confidence','')}</td>"
-            "</tr>"
+
+    def _render_table(transactions: List[Dict[str, Any]]) -> str:
+        rows = []
+        for t in (transactions or [])[:1000]:
+            rows.append(
+                "<tr>"
+                f"<td>{t.get('date','')}</td>"
+                f"<td>{t.get('paymentType','')}</td>"
+                f"<td>{t.get('paidOutGbp','')}</td>"
+                f"<td>{t.get('paidInGbp','')}</td>"
+                f"<td>{t.get('balanceGbp','')}</td>"
+                f"<td>{t.get('type','')}</td>"
+                f"<td>{t.get('amount','')}</td>"
+                f"<td>{str(t.get('payeePayer','')).replace('<','&lt;')}</td>"
+                f"<td>{str(t.get('transactionDescription') or t.get('description','')).replace('<','&lt;')}</td>"
+                f"<td>{str(t.get('originalSourceText','')).replace('<','&lt;')}</td>"
+                f"<td>{str(t.get('reference','')).replace('<','&lt;')}</td>"
+                f"<td>{t.get('confidence','')}</td>"
+                "</tr>"
+            )
+        return (
+            "<table><thead><tr>"
+            "<th>Date</th><th>Payment Type</th><th>Paid out</th><th>Paid in</th><th>Balance</th><th>Type</th>"
+            "<th>Amount</th><th>Payee/Payer</th><th>Transaction Description</th><th>Original Source Text</th>"
+            "<th>Reference</th><th>Confidence</th>"
+            "</tr></thead><tbody>"
+            + ("".join(rows) if rows else '<tr><td colspan="12">No transactions</td></tr>')
+            + "</tbody></table>"
         )
-    meta = json.dumps({"ok": payload.get("ok"), "steps": payload.get("steps", []), "notes": payload.get("notes", [])}, indent=2)
-    csv_text = str(payload.get("statementCsv") or "")
-    vision_dump = payload.get("googleVisionDump")
-    vision_err = payload.get("googleVisionDumpError")
-    vision_text = ""
+
+    # Run both parses so the UI can compare.
+    pdfplumber_result = await parse_bank_statement_from_url(
+        url=url,
+        authorization=auth,
+        includeVisionDump=False,
+        useVision=False,
+    )
+    vision_result = await parse_bank_statement_from_url(
+        url=url,
+        authorization=auth,
+        includeVisionDump=True,
+        useVision=True,
+        visionMaxPages=visionMaxPages,
+        visionDpi=visionDpi,
+    )
+
+    pdfplumber_payload = _json_from_result(pdfplumber_result)
+    vision_payload = _json_from_result(vision_result)
+
+    pdfplumber_tx = pdfplumber_payload.get("transactions", []) if isinstance(pdfplumber_payload, dict) else []
+    vision_tx = vision_payload.get("transactions", []) if isinstance(vision_payload, dict) else []
+
+    pdfplumber_meta = json.dumps(
+        {"ok": pdfplumber_payload.get("ok"), "steps": pdfplumber_payload.get("steps", []), "notes": pdfplumber_payload.get("notes", [])},
+        indent=2,
+    )
+    vision_meta = json.dumps(
+        {"ok": vision_payload.get("ok"), "steps": vision_payload.get("steps", []), "notes": vision_payload.get("notes", [])},
+        indent=2,
+    )
+
+    pdfplumber_csv = str(pdfplumber_payload.get("statementCsv") or "")
+    vision_csv = str(vision_payload.get("statementCsv") or "")
+
+    vision_err = vision_payload.get("googleVisionDumpError")
+    vision_dump_preview = ""
+    vision_dump = vision_payload.get("googleVisionDump")
     if vision_dump is not None:
         try:
-            vision_text = json.dumps(vision_dump, indent=2)
+            # Don't inline the full dump in HTML (it can be huge). Show a preview + a download link.
+            blob = json.dumps(vision_dump, indent=2)
+            vision_dump_preview = blob[:20000] + ("\n... (truncated preview; use download link for full JSON)" if len(blob) > 20000 else "")
         except Exception:
-            vision_text = str(vision_dump)
+            vision_dump_preview = str(vision_dump)[:20000]
     elif vision_err:
-        vision_text = f"(not available: {vision_err})"
+        vision_dump_preview = f"(not available: {vision_err})"
+
+    # Preserve the token for convenience in download links.
+    token_q = f"&token={token}" if token else ""
+    vision_dump_download_url = (
+        f"/parse-bank-statement/vision-dump?url={requests.utils.quote(url, safe='')}{token_q}"
+        f"&visionMaxPages={int(visionMaxPages)}&visionDpi={int(visionDpi)}"
+    )
+
     return f"""<!doctype html>
 <html><head><meta charset="utf-8"/><title>TaxPig Quick View</title>
-<style>body{{font-family:Arial;margin:18px}}table{{border-collapse:collapse;width:100%}}th,td{{border:1px solid #ddd;padding:6px;font-size:12px}}th{{background:#f3f3f3}}pre{{background:#111;color:#eee;padding:8px}}</style>
+<style>
+  body{{font-family:Arial;margin:18px}}
+  table{{border-collapse:collapse;width:100%}}
+  th,td{{border:1px solid #ddd;padding:6px;font-size:12px;vertical-align:top}}
+  th{{background:#f3f3f3}}
+  pre{{background:#111;color:#eee;padding:8px;overflow:auto;max-height:520px}}
+  .tabs{{display:flex;gap:8px;margin:12px 0}}
+  .tabbtn{{padding:8px 10px;border:1px solid #bbb;border-radius:6px;background:#fafafa;cursor:pointer}}
+  .tabbtn.active{{background:#111;color:#fff;border-color:#111}}
+  .panel{{display:none}}
+  .panel.active{{display:block}}
+  .muted{{color:#666;font-size:12px}}
+</style>
 </head><body>
 <h3>Quick View: {url}</h3>
-<p>Rows shown: {len(tx)}</p>
-<table><thead><tr><th>Date</th><th>Payment Type</th><th>Paid out</th><th>Paid in</th><th>Balance</th><th>Type</th><th>Amount</th><th>Payee/Payer</th><th>Transaction Description</th><th>Original Source Text</th><th>Reference</th><th>Confidence</th></tr></thead>
-<tbody>{''.join(rows) if rows else '<tr><td colspan="12">No transactions</td></tr>'}</tbody></table>
-<h4>Google Vision Dump</h4><pre>{vision_text.replace('<','&lt;')}</pre>
-<h4>Statement CSV</h4><pre>{csv_text.replace('<','&lt;')}</pre>
-<h4>Steps / Notes</h4><pre>{meta}</pre>
+<div class="muted">
+  Tabs: pdfplumber-first vs Google Vision. Vision dump download:
+  <a href="{vision_dump_download_url}">/parse-bank-statement/vision-dump</a>
+</div>
+<div class="tabs">
+  <button class="tabbtn active" data-tab="pdfplumber">pdfplumber</button>
+  <button class="tabbtn" data-tab="vision">google vision</button>
+</div>
+
+<div id="pdfplumber" class="panel active">
+  <h4>pdfplumber-first parse</h4>
+  <p class="muted">Rows shown: {len(pdfplumber_tx)}</p>
+  {_render_table(pdfplumber_tx)}
+  <h4>Statement CSV</h4><pre>{pdfplumber_csv.replace('<','&lt;')}</pre>
+  <h4>Steps / Notes</h4><pre>{pdfplumber_meta}</pre>
+</div>
+
+<div id="vision" class="panel">
+  <h4>Google Vision parse (visionMaxPages={int(visionMaxPages)} dpi={int(visionDpi)})</h4>
+  <p class="muted">Rows shown: {len(vision_tx)}</p>
+  {_render_table(vision_tx)}
+  <h4>Google Vision Dump (preview)</h4><pre>{vision_dump_preview.replace('<','&lt;')}</pre>
+  <h4>Statement CSV</h4><pre>{vision_csv.replace('<','&lt;')}</pre>
+  <h4>Steps / Notes</h4><pre>{vision_meta}</pre>
+</div>
+
+<script>
+  const btns = Array.from(document.querySelectorAll('.tabbtn'));
+  const panels = Array.from(document.querySelectorAll('.panel'));
+  for (const b of btns) {{
+    b.addEventListener('click', () => {{
+      for (const x of btns) x.classList.toggle('active', x === b);
+      const id = b.getAttribute('data-tab');
+      for (const p of panels) p.classList.toggle('active', p.id === id);
+    }});
+  }}
+</script>
 </body></html>"""
+
+
+@app.get("/parse-bank-statement/vision-dump")
+async def parse_bank_statement_vision_dump(
+    url: str,
+    token: Optional[str] = None,
+    authorization: Optional[str] = Header(default=None),
+    visionMaxPages: int = GOOGLE_VISION_DEFAULT_MAX_PAGES,
+    visionDpi: int = GOOGLE_VISION_DEFAULT_DPI,
+):
+    """
+    Convenience endpoint for debugging: returns the exact Vision API response (JSON) for a URL.
+    """
+    auth = authorization or (f"Bearer {token}" if token else None)
+    result = await parse_bank_statement_from_url(
+        url=url,
+        authorization=auth,
+        includeVisionDump=True,
+        useVision=True,
+        visionMaxPages=visionMaxPages,
+        visionDpi=visionDpi,
+    )
+    payload = _json_from_result(result)
+    dump = payload.get("googleVisionDump")
+    err = payload.get("googleVisionDumpError")
+    if dump is None:
+        return JSONResponse(status_code=400, content={"ok": False, "error": err or "no_dump"})
+    return JSONResponse(content=dump)
 
 
 @app.post("/parse-bank-statement")
@@ -1389,6 +1671,9 @@ async def parse_bank_statement(
     file: UploadFile = File(...),
     authorization: Optional[str] = Header(default=None),
     includeVisionDump: bool = False,
+    useVision: bool = False,
+    visionMaxPages: int = GOOGLE_VISION_DEFAULT_MAX_PAGES,
+    visionDpi: int = GOOGLE_VISION_DEFAULT_DPI,
 ):
     steps: List[Dict[str, str]] = []
     notes: List[str] = []
@@ -1430,47 +1715,77 @@ async def parse_bank_statement(
         google_vision_dump: Optional[Dict[str, Any]] = None
         google_vision_err: Optional[str] = None
         if ext == ".pdf":
-            pages = extract_pdfplumber_pages(pdf_bytes)
-            add_step(steps, "pdfplumber", "success", f"Extracted {len(pages)} pages.")
-            for page_data in pages:
-                page_number = int(page_data["pageNumber"])
-                reconstructed_text_chunks.append(page_data.get("text", ""))
-                ok, reasons = quality_assess_page(page_data)
-                if ok:
-                    page_rows = reconstruct_rows_geometric(page_data, source="pdfplumber")
-                    raw_rows.extend(page_rows)
-                    add_step(
-                        steps,
-                        "quality_assess_page",
-                        "success",
-                        f"page={page_number} pdfplumber_ok rows={len(page_rows)}",
-                    )
-                else:
-                    add_step(
-                        steps,
-                        "quality_assess_page",
-                        "failed",
-                        f"page={page_number} reasons={','.join(reasons)}",
-                    )
-                    ocr_rows, ocr_detail = ocr_page_if_needed(pdf_bytes, page_number, reasons)
-                    if ocr_rows:
-                        raw_rows.extend(ocr_rows)
-                        ocr_pages.append(f"page {page_number}: {ocr_detail}")
-                        add_step(steps, "ocr_page_if_needed", "success", ocr_detail)
-                    else:
-                        notes.append(f"OCR skipped/failed for page {page_number}: {ocr_detail}")
-                        add_step(steps, "ocr_page_if_needed", "failed", ocr_detail)
-        else:
-            # Debug-only: capture raw Google Vision response (if configured) for this image upload.
-            if includeVisionDump:
-                google_vision_dump, google_vision_err = try_google_vision_dump(pdf_bytes)
-            ocr_rows, ocr_detail = ocr_image_file(pdf_bytes)
-            if ocr_rows:
-                raw_rows.extend(ocr_rows)
-                add_step(steps, "ocr_image_file", "success", ocr_detail)
+            if useVision:
+                vision_rows, google_vision_dump, google_vision_err = _parse_pdf_with_google_vision(
+                    pdf_bytes,
+                    max_pages=int(visionMaxPages),
+                    dpi=int(visionDpi),
+                    steps=steps,
+                    include_dump=includeVisionDump,
+                )
+                raw_rows.extend(vision_rows)
             else:
-                add_step(steps, "ocr_image_file", "failed", ocr_detail)
-                notes.append(f"Image OCR failed: {ocr_detail}")
+                pages = extract_pdfplumber_pages(pdf_bytes)
+                add_step(steps, "pdfplumber", "success", f"Extracted {len(pages)} pages.")
+                for page_data in pages:
+                    page_number = int(page_data["pageNumber"])
+                    reconstructed_text_chunks.append(page_data.get("text", ""))
+                    ok, reasons = quality_assess_page(page_data)
+                    if ok:
+                        page_rows = reconstruct_rows_geometric(page_data, source="pdfplumber")
+                        raw_rows.extend(page_rows)
+                        add_step(
+                            steps,
+                            "quality_assess_page",
+                            "success",
+                            f"page={page_number} pdfplumber_ok rows={len(page_rows)}",
+                        )
+                    else:
+                        add_step(
+                            steps,
+                            "quality_assess_page",
+                            "failed",
+                            f"page={page_number} reasons={','.join(reasons)}",
+                        )
+                        ocr_rows, ocr_detail = ocr_page_if_needed(pdf_bytes, page_number, reasons)
+                        if ocr_rows:
+                            raw_rows.extend(ocr_rows)
+                            ocr_pages.append(f"page {page_number}: {ocr_detail}")
+                            add_step(steps, "ocr_page_if_needed", "success", ocr_detail)
+                        else:
+                            notes.append(f"OCR skipped/failed for page {page_number}: {ocr_detail}")
+                            add_step(steps, "ocr_page_if_needed", "failed", ocr_detail)
+        else:
+            # Image upload: allow either Vision-based parse or Tesseract parse.
+            if useVision:
+                google_vision_dump, google_vision_err = try_google_vision_dump(pdf_bytes)
+                if google_vision_dump:
+                    page_data = {
+                        "pageNumber": 1,
+                        "width": 0.0,
+                        "height": 0.0,
+                        "words": _vision_dump_page_to_words(google_vision_dump),
+                        "tables": [],
+                        "text": _vision_dump_to_page_text(google_vision_dump),
+                    }
+                    page_rows = reconstruct_rows_statement_columns(page_data, source="google_vision_image")
+                    if not page_rows:
+                        page_rows = reconstruct_rows_geometric(page_data, source="google_vision_image")
+                    raw_rows.extend(page_rows)
+                    add_step(steps, "google_vision_image_parse", "success", f"rows={len(page_rows)}")
+                else:
+                    add_step(steps, "google_vision_image_parse", "failed", google_vision_err or "no_dump")
+            else:
+                # Debug-only: capture raw Google Vision response (if configured) for this image upload.
+                if includeVisionDump:
+                    google_vision_dump, google_vision_err = try_google_vision_dump(pdf_bytes)
+                ocr_rows, ocr_detail = ocr_image_file(pdf_bytes)
+                if ocr_rows:
+                    raw_rows.extend(ocr_rows)
+                    add_step(steps, "ocr_image_file", "success", ocr_detail)
+                else:
+                    add_step(steps, "ocr_image_file", "failed", ocr_detail)
+                    notes.append(f"Image OCR failed: {ocr_detail}")
 
         add_step(steps, "reconstruct_rows_geometric", "success", f"raw_rows={len(raw_rows)}")
         transactions, failed_rows = normalize_transactions(raw_rows)
